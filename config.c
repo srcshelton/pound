@@ -76,9 +76,10 @@ static CODE facilitynames[] = {
 static regex_t  Empty, Comment, User, Group, RootJail, Daemon, LogFacility, LogLevel, Alive, SSLEngine, Control;
 static regex_t  ListenHTTP, ListenHTTPS, End, Address, Port, Cert, xHTTP, Client, CheckURL;
 static regex_t  Err414, Err500, Err501, Err503, MaxRequest, HeadRemove, RewriteLocation, RewriteDestination;
-static regex_t  Service, URL, HeadRequire, HeadDeny, BackEnd, Emergency, Priority, HAport, HAportAddr, Redirect, TimeOut;
-static regex_t  Session, Type, TTL, ID;
+static regex_t  Service, ServiceName, URL, HeadRequire, HeadDeny, BackEnd, Emergency, Priority, HAport, HAportAddr;
+static regex_t  Redirect, TimeOut, Session, Type, TTL, ID, DynScale;
 static regex_t  ClientCert, AddHeader, Ciphers, CAlist, VerifyList, CRLlist, NoHTTPS11;
+static regex_t  Grace;
 
 static regmatch_t   matches[5];
 
@@ -90,7 +91,12 @@ static char *xhttp[] = {
     "^(GET|POST|HEAD|PUT|DELETE|LOCK|UNLOCK|PROPFIND|PROPPATCH|SEARCH|MKCOL|MOVE|COPY|OPTIONS|TRACE|MKACTIVITY|CHECKOUT|MERGE|REPORT|SUBSCRIBE|BPROPPATCH|POLL|BMOVE|BCOPY|BDELETE|CONNECT|RPC_IN_DATA|RPC_OUT_DATA) ([^ ]+) HTTP/1.[01]$",
 };
 
+static int  log_level = 1;
+static int  def_facility = LOG_DAEMON;
+static int  clnt_to = 10;
+static int  be_to = 15;
 static int  n_lin = 0;
+static int  dynscale = 0;
 
 /*
  * parse a back-end
@@ -110,10 +116,10 @@ parse_be(FILE *const f_conf, const int is_emergency)
     memset(res, 0, sizeof(BACKEND));
     res->be_type = BACK_END;
     res->domain = PF_UNSPEC;
-    res->to = is_emergency? 120: 15;
+    res->to = is_emergency? 120: be_to;
     res->alive = 1;
     memset(&res->addr, 0, sizeof(res->addr));
-    res->priority = 1;
+    res->priority = 5;
     memset(&res->HA, 0, sizeof(res->HA));
     res->url = NULL;
     res->next = NULL;
@@ -307,7 +313,7 @@ parse_sess(FILE *const f_conf, SERVICE *const svc)
  * parse a service
  */
 static SERVICE *
-parse_service(FILE *const f_conf)
+parse_service(FILE *const f_conf, const char *svc_name)
 {
     char        lin[MAXBUF];
     SERVICE     *res;
@@ -320,7 +326,10 @@ parse_service(FILE *const f_conf)
     }
     memset(res, 0, sizeof(SERVICE));
     res->sess_type = SESS_NONE;
+    res->dynscale = dynscale;
     pthread_mutex_init(&res->mut, NULL);
+    if(svc_name)
+        strncpy(res->name, svc_name, KEY_SIZE);
     while(fgets(lin, MAXBUF, f_conf)) {
         n_lin++;
         if(strlen(lin) > 0 && lin[strlen(lin) - 1] == '\n')
@@ -444,6 +453,8 @@ parse_service(FILE *const f_conf)
             for(be = res->backends; be; be = be->next)
                 res->tot_pri += be->priority;
             return res;
+        } else if(!regexec(&DynScale, lin, 4, matches, 0)) {
+            res->dynscale = atoi(lin + matches[1].rm_so);
         } else {
             logmsg(LOG_ERR, "line %d: unknown directive \"%s\" - aborted", n_lin, lin);
             exit(1);
@@ -504,18 +515,15 @@ parse_HTTP(FILE *const f_conf)
         exit(1);
     }
     memset(res, 0, sizeof(LISTENER));
-    res->to = 10;
+    res->to = clnt_to;
     res->rewr_loc = 1;
     res->err414 = "Request URI is too long";
     res->err500 = "An internal server error occurred. Please try again later.";
     res->err501 = "This method may not be used.";
     res->err503 = "The service is not available. Please try again later.";
+    res->log_level = log_level;
     if(regcomp(&res->verb, xhttp[0], REG_ICASE | REG_NEWLINE | REG_EXTENDED)) {
         logmsg(LOG_ERR, "line %d: xHTTP bad default pattern - aborted", n_lin);
-        exit(1);
-    }
-    if(regcomp(&res->url_pat, ".*", REG_ICASE | REG_NEWLINE | REG_EXTENDED)) {
-        logmsg(LOG_ERR, "line %d: CheckURL bad default pattern - aborted", n_lin);
         exit(1);
     }
     has_addr = has_port = 0;
@@ -550,12 +558,16 @@ parse_HTTP(FILE *const f_conf)
         } else if(!regexec(&Client, lin, 4, matches, 0)) {
             res->to = atoi(lin + matches[1].rm_so);
         } else if(!regexec(&CheckURL, lin, 4, matches, 0)) {
+            if(res->has_pat) {
+                logmsg(LOG_ERR, "line %d: CheckURL multiple pattern - aborted", n_lin);
+                exit(1);
+            }
             lin[matches[1].rm_eo] = '\0';
-            regfree(&res->url_pat);
             if(regcomp(&res->url_pat, lin + matches[1].rm_so, REG_ICASE | REG_NEWLINE | REG_EXTENDED)) {
                 logmsg(LOG_ERR, "line %d: CheckURL bad pattern \"%s\" - aborted", n_lin, lin + matches[1].rm_so);
                 exit(1);
             }
+            res->has_pat = 1;
         } else if(!regexec(&Err414, lin, 4, matches, 0)) {
             lin[matches[1].rm_eo] = '\0';
             res->err414 = file2str(lin + matches[1].rm_so);
@@ -596,13 +608,24 @@ parse_HTTP(FILE *const f_conf)
             res->rewr_loc = atoi(lin + matches[1].rm_so);
         } else if(!regexec(&RewriteDestination, lin, 4, matches, 0)) {
             res->rewr_dest = atoi(lin + matches[1].rm_so);
+        } else if(!regexec(&LogLevel, lin, 4, matches, 0)) {
+            res->log_level = atoi(lin + matches[1].rm_so);
         } else if(!regexec(&Service, lin, 4, matches, 0)) {
             if(res->services == NULL)
-                res->services = parse_service(f_conf);
+                res->services = parse_service(f_conf, NULL);
             else {
                 for(svc = res->services; svc->next; svc = svc->next)
                     ;
-                svc->next = parse_service(f_conf);
+                svc->next = parse_service(f_conf, NULL);
+            }
+        } else if(!regexec(&ServiceName, lin, 4, matches, 0)) {
+            lin[matches[1].rm_eo] = '\0';
+            if(res->services == NULL)
+                res->services = parse_service(f_conf, lin + matches[1].rm_so);
+            else {
+                for(svc = res->services; svc->next; svc = svc->next)
+                    ;
+                svc->next = parse_service(f_conf, lin + matches[1].rm_so);
             }
         } else if(!regexec(&End, lin, 4, matches, 0)) {
             if(!has_addr || !has_port) {
@@ -652,18 +675,15 @@ parse_HTTPS(FILE *const f_conf)
         exit(1);
     }
 
-    res->to = 10;
+    res->to = clnt_to;
     res->rewr_loc = 1;
     res->err414 = "Request URI is too long";
     res->err500 = "An internal server error occurred. Please try again later.";
     res->err501 = "This method may not be used.";
     res->err503 = "The service is not available. Please try again later.";
+    res->log_level = log_level;
     if(regcomp(&res->verb, xhttp[0], REG_ICASE | REG_NEWLINE | REG_EXTENDED)) {
         logmsg(LOG_ERR, "line %d: xHTTP bad default pattern - aborted", n_lin);
-        exit(1);
-    }
-    if(regcomp(&res->url_pat, ".*", REG_ICASE | REG_NEWLINE | REG_EXTENDED)) {
-        logmsg(LOG_ERR, "line %d: CheckURL bad default pattern - aborted", n_lin);
         exit(1);
     }
     has_addr = has_port = has_cert = 0;
@@ -698,12 +718,16 @@ parse_HTTPS(FILE *const f_conf)
         } else if(!regexec(&Client, lin, 4, matches, 0)) {
             res->to = atoi(lin + matches[1].rm_so);
         } else if(!regexec(&CheckURL, lin, 4, matches, 0)) {
+            if(res->has_pat) {
+                logmsg(LOG_ERR, "line %d: CheckURL multiple pattern - aborted", n_lin);
+                exit(1);
+            }
             lin[matches[1].rm_eo] = '\0';
-            regfree(&res->url_pat);
             if(regcomp(&res->url_pat, lin + matches[1].rm_so, REG_ICASE | REG_NEWLINE | REG_EXTENDED)) {
                 logmsg(LOG_ERR, "line %d: CheckURL bad pattern \"%s\" - aborted", n_lin, lin + matches[1].rm_so);
                 exit(1);
             }
+            res->has_pat = 1;
         } else if(!regexec(&Err414, lin, 4, matches, 0)) {
             lin[matches[1].rm_eo] = '\0';
             res->err414 = file2str(lin + matches[1].rm_so);
@@ -744,6 +768,8 @@ parse_HTTPS(FILE *const f_conf)
             res->rewr_loc = atoi(lin + matches[1].rm_so);
         } else if(!regexec(&RewriteDestination, lin, 4, matches, 0)) {
             res->rewr_dest = atoi(lin + matches[1].rm_so);
+        } else if(!regexec(&LogLevel, lin, 4, matches, 0)) {
+            res->log_level = atoi(lin + matches[1].rm_so);
         } else if(!regexec(&Cert, lin, 4, matches, 0)) {
             lin[matches[1].rm_eo] = '\0';
             if(SSL_CTX_use_certificate_chain_file(res->ctx, lin + matches[1].rm_so) != 1) {
@@ -834,11 +860,20 @@ parse_HTTPS(FILE *const f_conf)
             res->noHTTPS11 = atoi(lin + matches[1].rm_so);
         } else if(!regexec(&Service, lin, 4, matches, 0)) {
             if(res->services == NULL)
-                res->services = parse_service(f_conf);
+                res->services = parse_service(f_conf, NULL);
             else {
                 for(svc = res->services; svc->next; svc = svc->next)
                     ;
-                svc->next = parse_service(f_conf);
+                svc->next = parse_service(f_conf, NULL);
+            }
+        } else if(!regexec(&ServiceName, lin, 4, matches, 0)) {
+            lin[matches[1].rm_eo] = '\0';
+            if(res->services == NULL)
+                res->services = parse_service(f_conf, lin + matches[1].rm_so);
+            else {
+                for(svc = res->services; svc->next; svc = svc->next)
+                    ;
+                svc->next = parse_service(f_conf, lin + matches[1].rm_so);
             }
         } else if(!regexec(&End, lin, 4, matches, 0)) {
             X509_STORE  *store;
@@ -849,7 +884,7 @@ parse_HTTPS(FILE *const f_conf)
             }
             SSL_CTX_set_mode(res->ctx, SSL_MODE_AUTO_RETRY);
             SSL_CTX_set_options(res->ctx, SSL_OP_ALL);
-            sprintf(lin, "%d-Pound-%l", getpid(), random());
+            sprintf(lin, "%d-Pound-%ld", getpid(), random());
             SSL_CTX_set_session_id_context(res->ctx, (unsigned char *)lin, strlen(lin));
             SSL_CTX_set_tmp_rsa_callback(res->ctx, RSA_tmp_callback);
             return res;
@@ -907,15 +942,26 @@ parse_file(FILE *const f_conf)
             daemonize = atoi(lin + matches[1].rm_so);
         } else if(!regexec(&LogFacility, lin, 4, matches, 0)) {
             lin[matches[1].rm_eo] = '\0';
-            for(i = 0; facilitynames[i].c_name; i++)
-                if(!strcmp(facilitynames[i].c_name, lin + matches[1].rm_so)) {
-                    log_facility = facilitynames[i].c_val;
-                    break;
-                }
+            if(lin[matches[1].rm_so] == '-')
+                def_facility = -1;
+            else
+                for(i = 0; facilitynames[i].c_name; i++)
+                    if(!strcmp(facilitynames[i].c_name, lin + matches[1].rm_so)) {
+                        def_facility = facilitynames[i].c_val;
+                        break;
+                    }
+        } else if(!regexec(&Grace, lin, 4, matches, 0)) {
+            grace = atoi(lin + matches[1].rm_so);
         } else if(!regexec(&LogLevel, lin, 4, matches, 0)) {
             log_level = atoi(lin + matches[1].rm_so);
+        } else if(!regexec(&Client, lin, 4, matches, 0)) {
+            clnt_to = atoi(lin + matches[1].rm_so);
         } else if(!regexec(&Alive, lin, 4, matches, 0)) {
             alive_to = atoi(lin + matches[1].rm_so);
+        } else if(!regexec(&DynScale, lin, 4, matches, 0)) {
+            dynscale = atoi(lin + matches[1].rm_so);
+        } else if(!regexec(&TimeOut, lin, 4, matches, 0)) {
+            be_to = atoi(lin + matches[1].rm_so);
 #if HAVE_OPENSSL_ENGINE_H
         } else if(!regexec(&SSLEngine, lin, 4, matches, 0)) {
             lin[matches[1].rm_eo] = '\0';
@@ -974,11 +1020,20 @@ parse_file(FILE *const f_conf)
             }
         } else if(!regexec(&Service, lin, 4, matches, 0)) {
             if(services == NULL)
-                services = parse_service(f_conf);
+                services = parse_service(f_conf, NULL);
             else {
                 for(svc = services; svc->next; svc = svc->next)
                     ;
-                svc->next = parse_service(f_conf);
+                svc->next = parse_service(f_conf, NULL);
+            }
+        } else if(!regexec(&ServiceName, lin, 4, matches, 0)) {
+            lin[matches[1].rm_eo] = '\0';
+            if(services == NULL)
+                services = parse_service(f_conf, lin + matches[1].rm_so);
+            else {
+                for(svc = services; svc->next; svc = svc->next)
+                    ;
+                svc->next = parse_service(f_conf, lin + matches[1].rm_so);
             }
         } else {
             logmsg(LOG_ERR, "line %d: unknown directive \"%s\" - aborted", n_lin, lin);
@@ -1004,8 +1059,9 @@ config_parse(const int argc, char **const argv)
     || regcomp(&Group, "^[ \t]*Group[ \t]+\"(.+)\"[ \t]*$", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
     || regcomp(&RootJail, "^[ \t]*RootJail[ \t]+\"(.+)\"[ \t]*$", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
     || regcomp(&Daemon, "^[ \t]*Daemon[ \t]+([01])[ \t]*$", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
-    || regcomp(&LogFacility, "^[ \t]*LogFacility[ \t]+([a-z0-9]+)[ \t]*$", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
-    || regcomp(&LogLevel, "^[ \t]*LogLevel[ \t]+([0-4])[ \t]*$", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
+    || regcomp(&LogFacility, "^[ \t]*LogFacility[ \t]+([a-z0-9-]+)[ \t]*$", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
+    || regcomp(&LogLevel, "^[ \t]*LogLevel[ \t]+([0-5])[ \t]*$", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
+    || regcomp(&Grace, "^[ \t]*Grace[ \t]+([0-9]+)[ \t]*$", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
     || regcomp(&Alive, "^[ \t]*Alive[ \t]+([1-9][0-9]*)[ \t]*$", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
     || regcomp(&SSLEngine, "^[ \t]*SSLEngine[ \t]+\"(.+)\"[ \t]*$", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
     || regcomp(&Control, "^[ \t]*Control[ \t]+\"(.+)\"[ \t]*$", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
@@ -1027,6 +1083,7 @@ config_parse(const int argc, char **const argv)
     || regcomp(&RewriteLocation, "^[ \t]*RewriteLocation[ \t]+([012])[ \t]*$", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
     || regcomp(&RewriteDestination, "^[ \t]*RewriteDestination[ \t]+([01])[ \t]*$", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
     || regcomp(&Service, "^[ \t]*Service[ \t]*$", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
+    || regcomp(&ServiceName, "^[ \t]*Service[ \t]+\"(.+)\"[ \t]*$", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
     || regcomp(&URL, "^[ \t]*URL[ \t]+\"(.+)\"[ \t]*$", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
     || regcomp(&HeadRequire, "^[ \t]*HeadRequire[ \t]+\"(.+)\"[ \t]*$", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
     || regcomp(&HeadDeny, "^[ \t]*HeadDeny[ \t]+\"(.+)\"[ \t]*$", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
@@ -1041,6 +1098,7 @@ config_parse(const int argc, char **const argv)
     || regcomp(&Type, "^[ \t]*Type[ \t]+([^ \t]+)[ \t]*$", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
     || regcomp(&TTL, "^[ \t]*TTL[ \t]+([1-9][0-9]*)[ \t]*$", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
     || regcomp(&ID, "^[ \t]*ID[ \t]+\"(.+)\"[ \t]*$", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
+    || regcomp(&DynScale, "^[ \t]*DynScale[ \t]+([01])[ \t]*$", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
     || regcomp(&ClientCert, "^[ \t]*ClientCert[ \t]+([0-3])[ \t]+([1-9])[ \t]*$", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
     || regcomp(&AddHeader, "^[ \t]*AddHeader[ \t]+\"(.+)\"[ \t]*$", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
     || regcomp(&Ciphers, "^[ \t]*Ciphers[ \t]+\"(.+)\"[ \t]*$", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
@@ -1075,6 +1133,27 @@ config_parse(const int argc, char **const argv)
         case 'V':
             print_log = 1;
             logmsg(LOG_DEBUG, "Version %s", VERSION);
+            logmsg(LOG_DEBUG, "  Configuration switches:");
+#ifdef  C_SUPER
+            if(strcmp(C_SUPER, "0"))
+                logmsg(LOG_DEBUG, "    --disable-super");
+#endif
+#ifdef  C_SSL
+            if(strcmp(C_SSL, ""))
+                logmsg(LOG_DEBUG, "    --with-ssl=%s", C_SSL);
+#endif
+#ifdef  C_T_RSA
+            if(strcmp(C_T_RSA, "0"))
+                logmsg(LOG_DEBUG, "    --with-t_rsa=%s", C_T_RSA);
+#endif
+#ifdef  C_OWNER
+            if(strcmp(C_OWNER, ""))
+                logmsg(LOG_DEBUG, "    --with-owner=%s", C_OWNER);
+#endif
+#ifdef  C_GROUP
+            if(strcmp(C_GROUP, ""))
+                logmsg(LOG_DEBUG, "    --with-group=%s", C_GROUP);
+#endif
             logmsg(LOG_DEBUG, "Exiting...");
             exit(0);
             break;
@@ -1099,8 +1178,7 @@ config_parse(const int argc, char **const argv)
 
     alive_to = 30;
     daemonize = 1;
-    log_facility = LOG_DAEMON;
-    log_level = 1;
+    grace = 30;
 
     services = NULL;
     listeners = NULL;
@@ -1127,6 +1205,7 @@ config_parse(const int argc, char **const argv)
     regfree(&Daemon);
     regfree(&LogFacility);
     regfree(&LogLevel);
+    regfree(&Grace);
     regfree(&Alive);
     regfree(&SSLEngine);
     regfree(&Control);
@@ -1148,6 +1227,7 @@ config_parse(const int argc, char **const argv)
     regfree(&RewriteLocation);
     regfree(&RewriteDestination);
     regfree(&Service);
+    regfree(&ServiceName);
     regfree(&URL);
     regfree(&HeadRequire);
     regfree(&HeadDeny);
@@ -1162,6 +1242,7 @@ config_parse(const int argc, char **const argv)
     regfree(&Type);
     regfree(&TTL);
     regfree(&ID);
+    regfree(&DynScale);
     regfree(&ClientCert);
     regfree(&AddHeader);
     regfree(&Ciphers);
@@ -1169,6 +1250,9 @@ config_parse(const int argc, char **const argv)
     regfree(&VerifyList);
     regfree(&CRLlist);
     regfree(&NoHTTPS11);
+
+    /* set the facility only here to ensure the syslog gets opened if necessary */
+    log_facility = def_facility;
 
     return;
 }

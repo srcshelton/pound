@@ -10,11 +10,74 @@ usage(const char *arg0)
     fprintf(stderr, "\t-l n - disable listener n\n");
     fprintf(stderr, "\t-S n m - enable service m in service n (use -1 for global services)\n");
     fprintf(stderr, "\t-s n m - disable service m in service n (use -1 for global services)\n");
-    fprintf(stderr, "\t-B n m r - enable back-end in service m in listener n\n");
-    fprintf(stderr, "\t-b n m r - disable back-end in service m in listener n\n");
+    fprintf(stderr, "\t-B n m r - enable back-end r in service m in listener n\n");
+    fprintf(stderr, "\t-b n m r - disable back-end r in service m in listener n\n");
+    fprintf(stderr, "\t-N n m k r - add a session with key k and back-end r in service m in listener n\n");
+    fprintf(stderr, "\t-n n m k - remove a session with key k r in service m in listener n\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "\tentering the command without arguments lists the current configuration.\n");
     exit(1);
+}
+
+static void
+be_prt(const int sock)
+{
+    BACKEND be;
+    int     n_be;
+
+    n_be = 0;
+    while(read(sock, (void *)&be, sizeof(BACKEND)) == sizeof(BACKEND)) {
+        if(be.disabled < 0)
+            break;
+        if(be.domain == PF_INET)
+            printf("    %3d. Backend PF_INET %s:%hd %s (%d %.3f sec) %s\n", n_be++, inet_ntoa(be.addr.in.sin_addr),
+                ntohs(be.addr.in.sin_port), be.disabled? "DISABLED": "active", be.priority, be.t_average,
+                be.alive? "alive": "DEAD");
+        else
+            printf("    %3d. Backend PF_UNIX %s %s (%d %.3f sec) %s\n", n_be++, be.addr.un.sun_path,
+                be.disabled? "DISABLED": "active", be.priority, be.t_average, be.alive? "alive": "DEAD");
+    }
+    return;
+}
+
+static void
+sess_prt(const int sock)
+{
+    TREENODE    sess;
+    int         n_be, n_sess, cont_len;
+    char        buf[KEY_SIZE + 1];
+
+    n_sess = 0;
+    while(read(sock, (void *)&sess, sizeof(TREENODE)) == sizeof(TREENODE)) {
+        if(sess.content == NULL)
+            break;
+        read(sock, &n_be, sizeof(n_be));
+        read(sock, &cont_len, sizeof(cont_len));
+        memset(buf, 0, KEY_SIZE + 1);
+        read(sock, buf, cont_len);
+        printf("    %3d. Session %s -> %d\n", n_sess++, buf, n_be);
+    }
+    return;
+}
+
+static void
+svc_prt(const int sock)
+{
+    SERVICE     svc;
+    int         n_svc;
+
+    n_svc = 0;
+    while(read(sock, (void *)&svc, sizeof(SERVICE)) == sizeof(SERVICE)) {
+        if(svc.disabled < 0)
+            break;
+        if(svc.name[0])
+            printf("  %3d. Service \"%s\" %s (%d)\n", n_svc++, svc.name, svc.disabled? "DISABLED": "active", svc.tot_pri);
+        else
+            printf("  %3d. Service %s (%d)\n", n_svc++, svc.disabled? "DISABLED": "active", svc.tot_pri);
+        be_prt(sock);
+        sess_prt(sock);
+    }
+    return;
 }
 
 static int
@@ -40,20 +103,21 @@ get_sock(const char *sock_name)
 main(const int argc, char **argv)
 {
     CTRL_CMD    cmd;
-    int         sock, n_lstn, n_svc, n_be, n_sess;
-    char        *arg0, *sock_name;
-    int         c_opt, en_lst, de_lst, en_svc, de_svc, en_be, de_be, is_set;
+    int         sock, n_lstn, n_svc, n_be, n_sess, i;
+    char        *arg0, *sock_name, buf[KEY_SIZE + 1];
+    int         c_opt, en_lst, de_lst, en_svc, de_svc, en_be, de_be, a_sess, d_sess, is_set;
     LISTENER    lstn;
     SERVICE     svc;
     BACKEND     be;
-    SESS        sess;
+    TREENODE    sess;
 
     arg0 = *argv;
     sock_name = NULL;
-    en_lst = de_lst = en_svc = de_svc = en_be = de_be = is_set = 0;
+    en_lst = de_lst = en_svc = de_svc = en_be = de_be = is_set = a_sess = d_sess = 0;
     memset(&cmd, 0, sizeof(cmd));
     opterr = 0;
-    while((c_opt = getopt(argc, argv, "c:LlSsBb")) > 0)
+    i = 0;
+    while(!i && (c_opt = getopt(argc, argv, "c:LlSsBbNn")) > 0)
         switch(c_opt) {
         case 'c':
             sock_name = optarg;
@@ -88,9 +152,24 @@ main(const int argc, char **argv)
                 usage(arg0);
             de_be = is_set = 1;
             break;
+        case 'N':
+            if(is_set)
+                usage(arg0);
+            a_sess = is_set = 1;
+            break;
+        case 'n':
+            if(is_set)
+                usage(arg0);
+            d_sess = is_set = 1;
+            break;
         default:
-            fprintf(stderr, "bad flag -%c", optopt);
-            usage(arg0);
+            if(optopt == '1') {
+                optind--;
+                i = 1;
+            } else {
+                fprintf(stderr, "bad flag -%c", optopt);
+                usage(arg0);
+            }
             break;
         }
 
@@ -117,6 +196,24 @@ main(const int argc, char **argv)
         cmd.service = atoi(argv[optind++]);
         cmd.backend = atoi(argv[optind++]);
     }
+    if(a_sess) {
+        if(optind != (argc - 4))
+            usage(arg0);
+        cmd.cmd = CTRL_ADD_SESS;
+        cmd.listener = atoi(argv[optind++]);
+        cmd.service = atoi(argv[optind++]);
+        memset(cmd.key, 0, KEY_SIZE + 1);
+        strncpy(cmd.key, argv[optind++], KEY_SIZE);
+        cmd.backend = atoi(argv[optind++]);
+    }
+    if(d_sess) {
+        if(optind != (argc - 3))
+            usage(arg0);
+        cmd.cmd = CTRL_DEL_SESS;
+        cmd.listener = atoi(argv[optind++]);
+        cmd.service = atoi(argv[optind++]);
+        strncpy(cmd.key, argv[optind++], KEY_SIZE);
+    }
     if(!is_set) {
         if(optind != argc)
             usage(arg0);
@@ -133,54 +230,10 @@ main(const int argc, char **argv)
                 break;
             printf("%3d. %s Listener %s:%hd %s\n", n_lstn++, lstn.ctx? "HTTPS" : "http",
                 inet_ntoa(lstn.addr.sin_addr), ntohs(lstn.addr.sin_port), lstn.disabled? "*D": "a");
-            n_svc = 0;
-            while(read(sock, (void *)&svc, sizeof(SERVICE)) == sizeof(SERVICE)) {
-                if(svc.disabled < 0)
-                    break;
-                printf("  %3d. Service %s\n", n_svc++, svc.disabled? "*D": "a");
-                n_be = 0;
-                while(read(sock, (void *)&be, sizeof(BACKEND)) == sizeof(BACKEND)) {
-                    if(be.disabled < 0)
-                        break;
-                    if(be.domain == PF_INET)
-                        printf("    %3d. Backend PF_INET %s:%hd %s\n", n_be++, inet_ntoa(be.addr.in.sin_addr),
-                            ntohs(be.addr.in.sin_port), be.disabled? "*D": "a");
-                    else
-                        printf("    %3d. Backend PF_UNIX %s %s\n", n_be++, be.addr.un.sun_path,
-                            be.disabled? "*D": "");
-                }
-                n_sess = 0;
-                while(read(sock, (void *)&sess, sizeof(SESS)) == sizeof(SESS)) {
-                    if((int)sess.to_host < 0)
-                        break;
-                    printf("    %3d. Session %s -> %d\n", n_sess++, sess.key, (int)sess.to_host);
-                }
-            }
+            svc_prt(sock);
         }
         printf(" -1. Global services\n");
-        n_svc = 0;
-        while(read(sock, (void *)&svc, sizeof(SERVICE)) == sizeof(SERVICE)) {
-            if(svc.disabled < 0)
-                break;
-            printf("  %3d. Service %s\n", n_svc++, svc.disabled? "*D": "a");
-            n_be = 0;
-            while(read(sock, (void *)&be, sizeof(BACKEND)) == sizeof(BACKEND)) {
-                if(be.disabled < 0)
-                    break;
-                if(be.domain == PF_INET)
-                    printf("    %3d. Backend PF_INET %s:%hd %s\n", n_be++, inet_ntoa(be.addr.in.sin_addr),
-                        ntohs(be.addr.in.sin_port), be.disabled? "*D": "a");
-                else
-                    printf("    %3d. Backend PF_UNIX %s %s\n", n_be++, be.addr.un.sun_path,
-                        be.disabled? "*D": "");
-            }
-            n_sess = 0;
-            while(read(sock, (void *)&sess, sizeof(SESS)) == sizeof(SESS)) {
-                if((int)sess.to_host < 0)
-                    break;
-                printf("    %3d. Session %s -> %d\n", n_sess++, sess.key, (int)sess.to_host);
-            }
-        }
+        svc_prt(sock);
     }
     return 0;
 }

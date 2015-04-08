@@ -38,8 +38,8 @@ char        *user,              /* user to run as */
 int         alive_to,           /* check interval for resurrection */
             daemonize,          /* run as daemon */
             log_facility,       /* log facility to use */
-            log_level,          /* logging mode - 0, 1, 2 */
             print_log,          /* print log messages to stdout/stderr */
+            grace,              /* grace period before shutdown */
             control_sock;       /* control socket */
 
 SERVICE     *services;          /* global services (if any) */
@@ -53,6 +53,8 @@ regex_t HEADER,             /* Allowed header */
         /* RESP_REDIR,         /* responses for which we rewrite Location */
         LOCATION,           /* the host we are redirected to */
         AUTHORIZATION;      /* the Authorisation header */
+
+static int  shut_down = 0;
 
 #ifndef  SOL_TCP
 /* for systems without the definition */
@@ -105,15 +107,36 @@ l_id(void)
 }
 
 /*
- * handle SIGTERM - exit
+ * handle SIGTERM/SIGQUIT - exit
  */
 static RETSIGTYPE
 h_term(const int sig)
 {
     logmsg(LOG_NOTICE, "received signal %d - exiting...", sig);
     if(son > 0)
-        kill(son, SIGTERM);
+        kill(son, sig);
     exit(0);
+}
+
+/*
+ * handle SIGHUP/SIGINT - exit after grace period
+ */
+static RETSIGTYPE
+h_shut(const int sig)
+{
+    int         status;
+    LISTENER    *lstn;
+
+    logmsg(LOG_NOTICE, "received signal %d - shutting down...", sig);
+    if(son > 0) {
+        for(lstn = listeners; lstn; lstn = lstn->next)
+            close(lstn->sock);
+        kill(son, sig);
+        while(wait(&status) != son)
+            logmsg(LOG_ERR, "MONITOR: bad wait (%s)", strerror(errno));
+        exit(0);
+    } else
+        shut_down = 1;
 }
 
 /*
@@ -143,13 +166,12 @@ main(const int argc, char **argv)
     print_log = 0;
     (void)umask(077);
     control_sock = -1;
-#ifndef  NO_SYSLOG
-    openlog("pound", LOG_CONS, LOG_DAEMON);
-#endif
+    log_facility = -1;
     logmsg(LOG_NOTICE, "starting...");
 
+    signal(SIGHUP, h_shut);
+    signal(SIGINT, h_shut);
     signal(SIGTERM, h_term);
-    signal(SIGINT, h_term);
     signal(SIGQUIT, h_term);
     signal(SIGPIPE, SIG_IGN);
 
@@ -162,8 +184,7 @@ main(const int argc, char **argv)
     l_init();
     CRYPTO_set_id_callback(l_id);
     CRYPTO_set_locking_callback(l_lock);
-    init_host_mut();
-    init_RSAgen();
+    init_timer();
 
     /* prepare regular expressions */
     if(regcomp(&HEADER, "^([a-z0-9!#$%&'*+.^_`|~-]+):[ \t]*(.*)[ \t]*$", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
@@ -189,6 +210,9 @@ main(const int argc, char **argv)
 
     /* read config */
     config_parse(argc, argv);
+
+    if(log_facility != -1)
+        openlog("pound", LOG_CONS | LOG_NDELAY, LOG_DAEMON);
 
     /* open HTTP listeners */
     for(lstn = listeners, n_listeners = 0; lstn; lstn = lstn->next, n_listeners++) {
@@ -249,11 +273,11 @@ main(const int argc, char **argv)
         /* daemonize - make ourselves a subprocess. */
         switch (fork()) {
             case 0:
-#ifndef NO_SYSLOG
-                close(0);
-                close(1);
-                close(2);
-#endif
+                if(log_facility != -1) {
+                    close(0);
+                    close(1);
+                    close(2);
+                }
                 break;
             case -1:
                 logmsg(LOG_ERR, "fork: %s - aborted", strerror(errno));
@@ -323,15 +347,9 @@ main(const int argc, char **argv)
                 exit(1);
             }
 #endif
-            /* start resurector */
-            if(pthread_create(&thr, &attr, thr_resurect, NULL)) {
+            /* start timer */
+            if(pthread_create(&thr, &attr, thr_timer, NULL)) {
                 logmsg(LOG_ERR, "create thr_resurect: %s - aborted", strerror(errno));
-                exit(1);
-            }
-
-            /* start the RSA stuff */
-            if(pthread_create(&thr, &attr, thr_RSAgen, NULL)) {
-                logmsg(LOG_ERR, "create thr_RSAgen: %s - aborted", strerror(errno));
                 exit(1);
             }
 
@@ -346,11 +364,16 @@ main(const int argc, char **argv)
 
             /* and start working */
             for(;;) {
+                if(shut_down) {
+                    logmsg(LOG_NOTICE, "shutting down...");
+                    for(lstn = listeners; lstn; lstn = lstn->next)
+                        close(lstn->sock);
+                    sleep(grace);
+                    logmsg(LOG_NOTICE, "grace period expired - exiting...");
+                    exit(0);
+                }
                 for(lstn = listeners, i = 0; i < n_listeners; lstn = lstn->next, i++) {
-                    if(lstn->disabled)
-                        polls[i].events = 0;
-                    else
-                        polls[i].events = POLLIN | POLLPRI;
+                    polls[i].events = POLLIN | POLLPRI;
                     polls[i].revents = 0;
                 }
                 if(poll(polls, n_listeners, -1) < 0) {
@@ -366,6 +389,12 @@ main(const int argc, char **argv)
                             } else if (clnt_addr.sin_family != AF_INET) {
                                 /* may happen on FreeBSD, I am told */
                                 logmsg(LOG_WARNING, "HTTP connection prematurely closed by peer");
+                                close(clnt);
+                            } else if(lstn->disabled) {
+                                /*
+                                addr2str(tmp, MAXBUF - 1, &clnt_addr.sin_addr);
+                                logmsg(LOG_WARNING, "HTTP disabled listener from %s", tmp);
+                                */
                                 close(clnt);
                             } else {
                                 thr_arg *arg;

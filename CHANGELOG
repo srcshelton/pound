@@ -1,4 +1,118 @@
 ------------------------------------------------------------------------
+r46 | roseg | 2007-04-11 15:00:11 +0200 (Wed, 11 Apr 2007) | 8 lines
+
+Release 2.3
+
+Enhancements:
+  - added display of configuration switches
+  - added grace period for shutdown (based on an idea from Rune Saetre)
+
+Bug fixes:
+
+------------------------------------------------------------------------
+r45 | roseg | 2007-04-04 18:15:53 +0200 (Wed, 04 Apr 2007) | 8 lines
+
+Release 2.2.8
+
+Enhancements:
+  - more tweaking of the dynamic rescaling code
+  - more information in poundctl printout
+
+Bug fixes:
+
+------------------------------------------------------------------------
+r44 | roseg | 2007-03-12 18:12:14 +0100 (Mon, 12 Mar 2007) | 8 lines
+
+Release 2.2.7
+
+Enhancements:
+  - dynamic scaling is now a configuration directive (DynScale)
+  - added vhost to LogLevel 5
+
+Bug fixes:
+
+------------------------------------------------------------------------
+r43 | roseg | 2007-03-02 10:30:01 +0100 (Fri, 02 Mar 2007) | 11 lines
+
+Release 2.2.6
+
+Enhancements:
+  - added transaction time to LogLevel 5
+  - added priority display for poundctl
+
+Bug fixes:
+  - fixed problem when adding session via poundctl
+  - fixed problem in session dump to poundctl
+  - fixed problem in kill_be call to t_clean
+
+------------------------------------------------------------------------
+r42 | roseg | 2007-02-19 18:19:22 +0100 (Mon, 19 Feb 2007) | 7 lines
+
+Release 2.2.5
+
+Enhancements:
+
+Bug fixes:
+  - fixed problem with sessions (BACKEND copying)
+
+------------------------------------------------------------------------
+r41 | roseg | 2007-02-10 15:26:42 +0100 (Sat, 10 Feb 2007) | 14 lines
+
+Release 2.2.4
+
+Enhancements:
+  - modular tree library
+  - consolidated all timed functions into a single thread
+  - added gethostbyname cache
+  - added LogLevel 5 - same as 4 but with service name and back-end information (thanks to Joe Gooch for the suggestion)
+  - added session creation and removal to poundctl
+
+Bug fixes:
+  - added LOG_NDELAY to openlog()
+  - accept and immediately close connections to disabled listeners (thanks to Joe Gooch for the suggestion)
+  - fixed problem with -1 values in poundctl
+
+------------------------------------------------------------------------
+r40 | roseg | 2007-01-19 21:29:07 +0100 (Fri, 19 Jan 2007) | 5 lines
+
+Release 2.2.3
+
+Bug fixes:
+  - fixed problems in bad 2.2 release
+
+------------------------------------------------------------------------
+r39 | roseg | 2007-01-15 18:17:48 +0100 (Mon, 15 Jan 2007) | 13 lines
+
+Release 2.2.2
+
+Enhancements:
+  - changes in the dynamic rescaling
+  - doubled the session key size (for those people with insanely long cookies)
+  - added LogFacility - for logging to stdout/stderr
+  - added optional Service names
+
+Bug fixes:
+  - fixed bug in multiple HeadRemove matching
+  - fixed problem with extra large session keys
+  - fixed problem for OpenBSD accept (blocks all threads)
+
+------------------------------------------------------------------------
+r38 | roseg | 2007-01-03 18:25:30 +0100 (Wed, 03 Jan 2007) | 13 lines
+
+Release 2.2.1
+
+Enhancements:
+  - allow specific Listeners to override the gloabl LogLevel value
+  - allow a default Client value to be defined at the global level
+  - allow a default TimeOut value to be defined at the global level
+  - added compile-time flags for file owner and group
+
+Bug fixes:
+  - fixed some problems in the installation procedure
+  - fixed problem in SSL session string
+  - added protocol check in need_rewrite
+
+------------------------------------------------------------------------
 r37 | roseg | 2006-12-16 10:18:38 +0100 (Sat, 16 Dec 2006) | 45 lines
 
 Release 2.2

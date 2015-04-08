@@ -306,7 +306,6 @@ get_headers(BIO *const in, BIO *const cl, const LISTENER *lstn)
         err_reply(cl, h414, lstn->err414);
         return NULL;
     }
-
     if((headers = (char **)calloc(MAXHEADERS, sizeof(char *))) == NULL) {
         logmsg(LOG_WARNING, "headers: out of memory");
         err_reply(cl, h500, lstn->err500);
@@ -387,8 +386,18 @@ log_bytes(char *res, const long cnt)
 }
 
 /* Cleanup code. This should really be in the pthread_cleanup_push, except for bugs in some implementations */
+/*
 #define clean_all() {   \
     if(ssl != NULL) { BIO_ssl_shutdown(cl); BIO_ssl_shutdown(cl); BIO_ssl_shutdown(cl); } \
+    if(be != NULL) { BIO_flush(be); BIO_reset(be); BIO_free_all(be); be = NULL; } \
+    if(cl != NULL) { BIO_flush(cl); BIO_reset(cl); BIO_free_all(cl); cl = NULL; } \
+    if(x509 != NULL) { X509_free(x509); x509 = NULL; } \
+    if(ssl != NULL) { ERR_clear_error(); ERR_remove_state(0); } \
+}
+*/
+
+#define clean_all() {   \
+    if(ssl != NULL) { BIO_ssl_shutdown(cl); } \
     if(be != NULL) { BIO_flush(be); BIO_reset(be); BIO_free_all(be); be = NULL; } \
     if(cl != NULL) { BIO_flush(cl); BIO_reset(cl); BIO_free_all(cl); cl = NULL; } \
     if(x509 != NULL) { X509_free(x509); x509 = NULL; } \
@@ -540,7 +549,7 @@ thr_http(void *arg)
         cl_11 = (request[strlen(request) - 1] == '1');
         strncpy(url, request + matches[2].rm_so, matches[2].rm_eo - matches[2].rm_so);
         url[matches[2].rm_eo - matches[2].rm_so] = '\0';
-        if(regexec(&lstn->url_pat,  url, 0, NULL, 0)) {
+        if(lstn->has_pat && regexec(&lstn->url_pat,  url, 0, NULL, 0)) {
             addr2str(caddr, MAXBUF - 1, &from_host);
             logmsg(LOG_NOTICE, "bad URL \"%s\" from %s", url, caddr);
             err_reply(cl, h501, lstn->err501);
@@ -582,7 +591,7 @@ thr_http(void *arg)
                     cont = atol(buf);
                 break;
             case HEADER_ILLEGAL:
-                if(log_level > 0) {
+                if(lstn->log_level > 0) {
                     addr2str(caddr, MAXBUF - 1, &from_host);
                     logmsg(LOG_NOTICE, "bad header from %s (%s)", caddr, headers[n]);
                 }
@@ -594,7 +603,8 @@ thr_http(void *arg)
                 MATCHER *m;
 
                 for(m = lstn->head_off; m; m = m->next)
-                    headers_ok[n] = regexec(&m->pat, headers[n], 0, NULL, 0);
+                    if(!(headers_ok[n] = regexec(&m->pat, headers[n], 0, NULL, 0)))
+                        break;
             }
             /* get User name */
             if(!regexec(&AUTHORIZATION, headers[n], 2, matches, 0)) {
@@ -958,16 +968,15 @@ thr_http(void *arg)
             else 
                 strncpy(buf, cur_backend->url, sizeof(buf) - 1);
             redirect_reply(cl, buf);
-            switch(log_level) {
+            addr2str(caddr, MAXBUF - 1, &from_host);
+            switch(lstn->log_level) {
             case 0:
                 break;
             case 1:
             case 2:
-                addr2str(caddr, MAXBUF - 1, &from_host);
                 logmsg(LOG_INFO, "%s %s - REDIRECT %s", caddr, request, buf);
                 break;
             case 3:
-                addr2str(caddr, MAXBUF - 1, &from_host);
                 if(v_host[0])
                     logmsg(LOG_INFO, "%s %s - %s [%s] \"%s\" 302 0 \"%s\" \"%s\"", v_host, caddr,
                         u_name[0]? u_name: "-", req_time, request, referer, u_agent);
@@ -976,7 +985,7 @@ thr_http(void *arg)
                         u_name[0]? u_name: "-", req_time, request, referer, u_agent);
                 break;
             case 4:
-                addr2str(caddr, MAXBUF - 1, &from_host);
+            case 5:
                 logmsg(LOG_INFO, "%s - %s [%s] \"%s\" 302 0 \"%s\" \"%s\"", caddr,
                     u_name[0]? u_name: "-", req_time, request, referer, u_agent);
                 break;
@@ -1162,41 +1171,48 @@ thr_http(void *arg)
             }
         }
         end_req = cur_time();
-        upd_be(cur_backend, end_req - start_req);
+        upd_be(svc, cur_backend, end_req - start_req);
 
         /* log what happened */
         strip_eol(request);
         strip_eol(response);
         memset(s_res_bytes, 0, LOG_BYTES_SIZE);
         log_bytes(s_res_bytes, res_bytes);
-        switch(log_level) {
+        addr2str(caddr, MAXBUF - 1, &from_host);
+        str_be(buf, MAXBUF - 1, cur_backend);
+        switch(lstn->log_level) {
         case 0:
             break;
         case 1:
-            addr2str(caddr, MAXBUF - 1, &from_host);
             logmsg(LOG_INFO, "%s %s - %s", caddr, request, response);
             break;
         case 2:
-            str_be(buf, MAXBUF - 1, cur_backend);
-            addr2str(caddr, MAXBUF - 1, &from_host);
             if(v_host[0])
-                logmsg(LOG_INFO, "%s %s - %s (%s -> %s) %.3f sec", caddr, request, response, v_host, buf,
+                logmsg(LOG_INFO, "%s %s - %s (%s/%s -> %s) %.3f sec",
+                    caddr, request, response, v_host, svc->name[0]? svc->name: "-", buf,
                     (end_req - start_req) / 1000000.0);
             else
-                logmsg(LOG_INFO, "%s %s - %s (%s) %.3f sec", caddr, request, response, buf,
+                logmsg(LOG_INFO, "%s %s - %s (%s -> %s) %.3f sec",
+                    caddr, request, response, svc->name[0]? svc->name: "-", buf,
                     (end_req - start_req) / 1000000.0);
             break;
         case 3:
-            addr2str(caddr, MAXBUF - 1, &from_host);
-            logmsg(LOG_INFO, "%s %s - %s [%s] \"%s\" %c%c%c %s \"%s\" \"%s\"", v_host[0]? v_host: "-",
+            logmsg(LOG_INFO, "%s %s - %s [%s] \"%s\" %c%c%c %s \"%s\" \"%s\"",
+                v_host[0]? v_host: "-",
                 caddr, u_name[0]? u_name: "-", req_time, request, response[9],
                 response[10], response[11], s_res_bytes, referer, u_agent);
             break;
         case 4:
-            addr2str(caddr, MAXBUF - 1, &from_host);
-            logmsg(LOG_INFO, "%s - %s [%s] \"%s\" %c%c%c %s \"%s\" \"%s\"", caddr,
-                u_name[0]? u_name: "-", req_time, request, response[9], response[10], response[11],
-                s_res_bytes, referer, u_agent);
+            logmsg(LOG_INFO, "%s - %s [%s] \"%s\" %c%c%c %s \"%s\" \"%s\"",
+                caddr, u_name[0]? u_name: "-", req_time, request, response[9], response[10],
+                response[11], s_res_bytes, referer, u_agent);
+            break;
+        case 5:
+            logmsg(LOG_INFO, "%s %s - %s [%s] \"%s\" %c%c%c %s \"%s\" \"%s\" (%s -> %s) %.3f sec",
+                v_host[0]? v_host: "-",
+                caddr, u_name[0]? u_name: "-", req_time, request, response[9], response[10],
+                response[11], s_res_bytes, referer, u_agent, svc->name[0]? svc->name: "-", buf,
+                (end_req - start_req) / 1000000.0);
             break;
         }
 
