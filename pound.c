@@ -39,23 +39,25 @@ int         alive_to,           /* check interval for resurrection */
             daemonize,          /* run as daemon */
             log_facility,       /* log facility to use */
             log_level,          /* logging mode - 0, 1, 2 */
-            print_log;          /* print log messages to stdout/stderr */
+            print_log,          /* print log messages to stdout/stderr */
+            control_sock;       /* control socket */
 
 SERVICE     *services;          /* global services (if any) */
 
 LISTENER    *listeners;         /* all available listeners */
 
-regex_t HTTP,               /* normal HTTP requests: GET, POST, HEAD */
-        XHTTP,              /* extended HTTP requests: PUT, DELETE */
-        WEBDAV,             /* WebDAV requests: LOCK, UNLOCK, SUBSCRIBE, PROPFIND, PROPPATCH, BPROPPATCH, SEARCH,
-                               POLL, MKCOL, MOVE, BMOVE, COPY, BCOPY, DELETE, BDELETE, CONNECT, OPTIONS, TRACE */
-        HEADER,             /* Allowed header */
+regex_t HEADER,             /* Allowed header */
         CHUNK_HEAD,         /* chunk header line */
         RESP_SKIP,          /* responses for which we skip response */
         RESP_IGN,           /* responses for which we ignore content */
         /* RESP_REDIR,         /* responses for which we rewrite Location */
         LOCATION,           /* the host we are redirected to */
         AUTHORIZATION;      /* the Authorisation header */
+
+#ifndef  SOL_TCP
+/* for systems without the definition */
+int     SOL_TCP;
+#endif
 
 /* worker pid */
 static  pid_t               son = 0;
@@ -76,17 +78,23 @@ l_init(void)
         exit(1);
     }
     for(i = 0; i < n_locks; i++)
+        /* pthread_mutex_init() always returns 0 */
         pthread_mutex_init(&l_array[i], NULL);
     return;
 }
 
 static void
-l_lock(int mode, int n, const char *file, int line)
+l_lock(const int mode, const int n, /* unused */ const char *file, /* unused */ int line)
 {
-    if(mode & CRYPTO_LOCK)
-        pthread_mutex_lock(&l_array[n]);
-    else
-        pthread_mutex_unlock(&l_array[n]);
+    int ret_val;
+
+    if(mode & CRYPTO_LOCK) {
+        if(ret_val = pthread_mutex_lock(&l_array[n]))
+            logmsg(LOG_ERR, "l_lock lock(): %s", strerror(ret_val));
+    } else {
+        if(ret_val = pthread_mutex_unlock(&l_array[n]))
+            logmsg(LOG_ERR, "l_lock unlock(): %s", strerror(ret_val));
+    }
     return;
 }
 
@@ -100,7 +108,7 @@ l_id(void)
  * handle SIGTERM - exit
  */
 static RETSIGTYPE
-h_term(int sig)
+h_term(const int sig)
 {
     logmsg(LOG_NOTICE, "received signal %d - exiting...", sig);
     if(son > 0)
@@ -116,7 +124,7 @@ h_term(int sig)
  */
 
 int
-main(int argc, char **argv)
+main(const int argc, char **argv)
 {
     int                 n_listeners, i, clnt_length, clnt;
     struct pollfd       *polls;
@@ -128,8 +136,13 @@ main(int argc, char **argv)
     FILE                *fpid;
     struct sockaddr_in  clnt_addr;
     char                tmp[MAXBUF];
+#ifndef SOL_TCP
+    struct protoent     *pe;
+#endif
 
     print_log = 0;
+    (void)umask(077);
+    control_sock = -1;
 #ifndef  NO_SYSLOG
     openlog("pound", LOG_CONS, LOG_DAEMON);
 #endif
@@ -149,30 +162,33 @@ main(int argc, char **argv)
     l_init();
     CRYPTO_set_id_callback(l_id);
     CRYPTO_set_locking_callback(l_lock);
+    init_host_mut();
     init_RSAgen();
 
-    /* read config */
-    config_parse(argc, argv);
-
     /* prepare regular expressions */
-    if(regcomp(&HTTP, "^(GET|POST|HEAD) ([^ ]+) HTTP/1.[01]$", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
-    || regcomp(&XHTTP, "^(PUT|DELETE) ([^ ]+) HTTP/1.[01]$", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
-#ifdef  MSDAV
-    || regcomp(&WEBDAV, "^(LOCK|UNLOCK|SUBSCRIBE|PROPFIND|PROPPATCH|BPROPPATCH|SEARCH|POLL|MKCOL|MOVE|BMOVE|COPY|BCOPY|DELETE|BDELETE|CONNECT|OPTIONS|TRACE|MKACTIVITY|CHECKOUT|MERGE|REPORT) ([^ ]+) HTTP/1.[01]$", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
-#else
-    || regcomp(&WEBDAV, "^(LOCK|UNLOCK) ([^ ]+) HTTP/1.[01]$", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
-#endif
-    || regcomp(&HEADER, "^([a-z0-9!#$%&'*+.^_`|~-]+):[ \t]*(.*)[ \t]*$", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
+    if(regcomp(&HEADER, "^([a-z0-9!#$%&'*+.^_`|~-]+):[ \t]*(.*)[ \t]*$", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
     || regcomp(&CHUNK_HEAD, "^([0-9a-f]+).*$", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
     || regcomp(&RESP_SKIP, "^HTTP/1.1 100.*$", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
     || regcomp(&RESP_IGN, "^HTTP/1.[01] (10[1-9]|1[1-9][0-9]|204|30[456]).*$", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
     /* || regcomp(&RESP_REDIR, "^HTTP/1.[01] 30[1237].*$", REG_ICASE | REG_NEWLINE | REG_EXTENDED) */
-    || regcomp(&LOCATION, "(http|https)://([^/]+)/(.*)", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
+    || regcomp(&LOCATION, "(http|https)://([^/]+)(.*)", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
     || regcomp(&AUTHORIZATION, "Authorization:[ \t]*Basic[ \t]*([^ \t]*)[ \t]*", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
     ) {
-        logmsg(LOG_ERR, "bad Regex - aborted");
+        logmsg(LOG_ERR, "bad essential Regex - aborted");
         exit(1);
     }
+
+#ifndef SOL_TCP
+    /* for systems without the definition */
+    if((pe = getprotobyname("tcp")) == NULL) {
+        logmsg(LOG_ERR, "missing TCP protocol");
+        exit(1);
+    }
+    SOL_TCP = pe->p_proto;
+#endif
+
+    /* read config */
+    config_parse(argc, argv);
 
     /* open HTTP listeners */
     for(lstn = listeners, n_listeners = 0; lstn; lstn = lstn->next, n_listeners++) {
@@ -255,7 +271,7 @@ main(int argc, char **argv)
         fprintf(fpid, "%d\n", getpid());
         fclose(fpid);
     } else
-        logmsg(LOG_WARNING, "Create \"%s\": %s", pid_name, strerror(errno));
+        logmsg(LOG_NOTICE, "Create \"%s\": %s", pid_name, strerror(errno));
 
     /* chroot if necessary */
     if(root_jail) {
@@ -307,7 +323,6 @@ main(int argc, char **argv)
                 exit(1);
             }
 #endif
-
             /* start resurector */
             if(pthread_create(&thr, &attr, thr_resurect, NULL)) {
                 logmsg(LOG_ERR, "create thr_resurect: %s - aborted", strerror(errno));
@@ -320,13 +335,22 @@ main(int argc, char **argv)
                 exit(1);
             }
 
+            /* start the controlling thread (if needed) */
+            if(control_sock >= 0 && pthread_create(&thr, &attr, thr_control, NULL)) {
+                logmsg(LOG_ERR, "create thr_control: %s - aborted", strerror(errno));
+                exit(1);
+            }
+
             /* pause to make sure the service threads were started */
             sleep(2);
 
             /* and start working */
             for(;;) {
-                for(i = 0; i < n_listeners; i++) {
-                    polls[i].events = POLLIN | POLLPRI;
+                for(lstn = listeners, i = 0; i < n_listeners; lstn = lstn->next, i++) {
+                    if(lstn->disabled)
+                        polls[i].events = 0;
+                    else
+                        polls[i].events = POLLIN | POLLPRI;
                     polls[i].revents = 0;
                 }
                 if(poll(polls, n_listeners, -1) < 0) {
