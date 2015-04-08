@@ -1,6 +1,6 @@
 /*
  * Pound - the reverse-proxy load-balancer
- * Copyright (C) 2002-2007 Apsis GmbH
+ * Copyright (C) 2002-2010 Apsis GmbH
  *
  * This file is part of Pound.
  *
@@ -9,7 +9,7 @@
  * the Free Software Foundation; either version 3 of the License, or
  * (at your option) any later version.
  * 
- * Foobar is distributed in the hope that it will be useful,
+ * Pound is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
@@ -22,7 +22,6 @@
  * P.O.Box
  * 8707 Uetikon am See
  * Switzerland
- * Tel: +41-44-920 4904
  * EMail: roseg@apsis.ch
  */
 
@@ -368,16 +367,21 @@ get_service(const LISTENER *lstn, const char *request, char **const headers)
 static int
 get_REQUEST(char *res, const SERVICE *svc, const char *request)
 {
-    int         n;
+    int         n, s;
     regmatch_t  matches[4];
 
-    if(regexec(&svc->sess_pat, request, 4, matches, 0)) {
+    if(regexec(&svc->sess_start, request, 4, matches, 0)) {
+        res[0] = '\0';
+        return 0;
+    }
+    s = matches[0].rm_eo;
+    if(regexec(&svc->sess_pat, request + s, 4, matches, 0)) {
         res[0] = '\0';
         return 0;
     }
     if((n = matches[1].rm_eo - matches[1].rm_so) > KEY_SIZE)
         n = KEY_SIZE;
-    strncpy(res, request + matches[1].rm_so, n);
+    strncpy(res, request + s + matches[1].rm_so, n);
     res[n] = '\0';
     return 1;
 }
@@ -385,7 +389,7 @@ get_REQUEST(char *res, const SERVICE *svc, const char *request)
 static int
 get_HEADERS(char *res, const SERVICE *svc, char **const headers)
 {
-    int         i, n;
+    int         i, n, s;
     regmatch_t  matches[4];
 
     /* this will match SESS_COOKIE, SESS_HEADER and SESS_BASIC */
@@ -393,11 +397,14 @@ get_HEADERS(char *res, const SERVICE *svc, char **const headers)
     for(i = 0; i < (MAXHEADERS - 1); i++) {
         if(headers[i] == NULL)
             continue;
-        if(regexec(&svc->sess_pat, headers[i], 4, matches, 0))
+        if(regexec(&svc->sess_start, headers[i], 4, matches, 0))
+            continue;
+        s = matches[0].rm_eo;
+        if(regexec(&svc->sess_pat, headers[i] + s, 4, matches, 0))
             continue;
         if((n = matches[1].rm_eo - matches[1].rm_so) > KEY_SIZE)
             n = KEY_SIZE;
-        strncpy(res, headers[i] + matches[1].rm_so, n);
+        strncpy(res, headers[i] + s + matches[1].rm_so, n);
         res[n] = '\0';
     }
     return res[0] != '\0';
@@ -897,7 +904,7 @@ do_resurect(void)
         default:
             continue;
         }
-        if(connect_nb(sock, &be->ha_addr, be->to) != 0) {
+        if(connect_nb(sock, &be->ha_addr, be->conn_to) != 0) {
             kill_be(svc, be, BE_KILL);
             str_be(buf, MAXBUF - 1, be);
             logmsg(LOG_NOTICE, "BackEnd %s is dead (HA)", buf);
@@ -933,7 +940,7 @@ do_resurect(void)
         default:
             continue;
         }
-        if(connect_nb(sock, &be->ha_addr, be->to) != 0) {
+        if(connect_nb(sock, &be->ha_addr, be->conn_to) != 0) {
             kill_be(svc, be, BE_KILL);
             str_be(buf, MAXBUF - 1, be);
             logmsg(LOG_NOTICE, "BackEnd %s is dead (HA)", buf);
@@ -988,7 +995,7 @@ do_resurect(void)
                 }
                 addr = &be->ha_addr;
             }
-            if(connect_nb(sock, addr, be->to) == 0) {
+            if(connect_nb(sock, addr, be->conn_to) == 0) {
                 be->resurrect = 1;
                 modified = 1;
             }
@@ -1057,7 +1064,7 @@ do_resurect(void)
                 }
                 addr = &be->ha_addr;
             }
-            if(connect_nb(sock, addr, be->to) == 0) {
+            if(connect_nb(sock, addr, be->conn_to) == 0) {
                 be->resurrect = 1;
                 modified = 1;
             }
@@ -1289,18 +1296,36 @@ static void
 do_RSAgen(void)
 {
     int n, ret_val;
+    RSA *t_RSA512_keys[N_RSA_KEYS];
+    RSA *t_RSA1024_keys[N_RSA_KEYS];
 
+    for(n = 0; n < N_RSA_KEYS; n++) {
+        t_RSA512_keys[n] = RSA_generate_key(512, RSA_F4, NULL, NULL);
+        t_RSA1024_keys[n] = RSA_generate_key(1024, RSA_F4, NULL, NULL);
+    }
     if(ret_val = pthread_mutex_lock(&RSA_mut))
         logmsg(LOG_WARNING, "thr_RSAgen() lock: %s", strerror(ret_val));
     for(n = 0; n < N_RSA_KEYS; n++) {
         RSA_free(RSA512_keys[n]);
-        RSA512_keys[n] = RSA_generate_key(512, RSA_F4, NULL, NULL);
+        RSA512_keys[n] = t_RSA512_keys[n];
         RSA_free(RSA1024_keys[n]);
-        RSA1024_keys[n] = RSA_generate_key(1024, RSA_F4, NULL, NULL);
+        RSA1024_keys[n] = t_RSA1024_keys[n];
     }
     if(ret_val = pthread_mutex_unlock(&RSA_mut))
         logmsg(LOG_WARNING, "thr_RSAgen() unlock: %s", strerror(ret_val));
     return;
+}
+
+#include    "dh512.h"
+#include    "dh1024.h"
+
+DH *
+DH_tmp_callback(/* not used */SSL *s, /* not used */int is_export, int keylength)
+{
+    if(keylength == 512)
+        return get_dh512();
+    else
+        return get_dh1024();
 }
 
 static time_t   last_RSA, last_rescale, last_alive, last_expire;
