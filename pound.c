@@ -35,6 +35,7 @@ char        *user,              /* user to run as */
             *ctrl_name;         /* control socket name */
 
 int         alive_to,           /* check interval for resurrection */
+            anonymise,          /* anonymise client address */
             daemonize,          /* run as daemon */
             log_facility,       /* log facility to use */
             print_log,          /* print log messages to stdout/stderr */
@@ -167,6 +168,21 @@ get_thr_arg(void)
 }
 
 /*
+ * get the current queue length
+ */
+get_thr_qlen(void)
+{
+    int     res;
+    thr_arg *tap;
+
+    (void)pthread_mutex_lock(&arg_mut);
+    for(res = 0, tap = first; tap != NULL; tap = tap->next, res++)
+        ;
+    (void)pthread_mutex_unlock(&arg_mut);
+    return res;
+}
+
+/*
  * handle SIGTERM/SIGQUIT - exit
  */
 static RETSIGTYPE
@@ -250,6 +266,23 @@ main(const int argc, char **argv)
     CRYPTO_set_id_callback(l_id);
     CRYPTO_set_locking_callback(l_lock);
     init_timer();
+
+    /* Disable SSL Compression for OpenSSL pre-1.0.  1.0 is handled with an option in config.c */
+#if OPENSSL_VERSION_NUMBER >= 0x00907000L
+#ifndef SSL_OP_NO_COMPRESSION
+    {
+      int i,n;
+      STACK_OF(SSL_COMP) *ssl_comp_methods;
+
+      ssl_comp_methods = SSL_COMP_get_compression_methods();
+      n = sk_SSL_COMP_num(ssl_comp_methods);
+
+      for(i=n-1; i>=0; i--) {
+        sk_SSL_COMP_delete(ssl_comp_methods, i);
+      }
+    }
+#endif
+#endif
 
     /* prepare regular expressions */
     if(regcomp(&HEADER, "^([a-z0-9!#$%&'*+.^_`|~-]+):[ \t]*(.*)[ \t]*$", REG_ICASE | REG_NEWLINE | REG_EXTENDED)

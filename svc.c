@@ -82,7 +82,11 @@ t_find(LHASH_OF(TABNODE) *const tab, char *const key)
     TABNODE t, *res;
 
     t.key = key;
+#if OPENSSL_VERSION_NUMBER >= 0x10000000L
+    if((res = (TABNODE *)LHM_lh_retrieve(TABNODE, tab, &t)) != NULL) {
+#else
     if((res = (TABNODE *)lh_retrieve(tab, &t)) != NULL) {
+#endif
         res->last_acc = time(NULL);
         return res->content;
     }
@@ -390,6 +394,7 @@ check_header(const char *header, char *const content)
         { "Referer",            7,  HEADER_REFERER },
         { "User-agent",         10, HEADER_USER_AGENT },
         { "Destination",        11, HEADER_DESTINATION },
+        { "Expect",             6,  HEADER_EXPECT },
         { "",                   0,  HEADER_OTHER },
     };
     int i;
@@ -749,7 +754,7 @@ upd_be(SERVICE *const svc, BACKEND *const be, const double elapsed)
  * Search for a host name, return the addrinfo for it
  */
 int
-get_host(char *const name, struct addrinfo *res)
+get_host(char *const name, struct addrinfo *res, int ai_family)
 {
     struct addrinfo *chain, *ap;
     struct addrinfo hints;
@@ -757,7 +762,7 @@ get_host(char *const name, struct addrinfo *res)
 
 #ifdef  HAVE_INET_NTOP
     memset (&hints, 0, sizeof(hints));
-    hints.ai_family = PF_UNSPEC;
+    hints.ai_family = ai_family;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_flags = AI_CANONNAME;
     if((ret_val = getaddrinfo(name, NULL, &hints, &chain)) == 0) {
@@ -800,7 +805,6 @@ need_rewrite(const int rewr_loc, char *const location, char *const path, const c
     struct sockaddr_in6     in6_addr, be6_addr;
     regmatch_t              matches[4];
     char                    *proto, *host, *port, *cp, buf[MAXBUF];
-    int                     ret_val;
 
     /* check if rewriting is required at all */
     if(rewr_loc == 0)
@@ -827,7 +831,7 @@ need_rewrite(const int rewr_loc, char *const location, char *const path, const c
      * Check if the location has the same address as the listener or the back-end
      */
     memset(&addr, 0, sizeof(addr));
-    if(get_host(host, &addr))
+    if(get_host(host, &addr, be->addr.ai_family))
         return 0;
 
     /*
@@ -837,31 +841,37 @@ need_rewrite(const int rewr_loc, char *const location, char *const path, const c
         free(addr.ai_addr);
         return 0;
     }
-    memset(buf, '\0', MAXBUF);
-    strncpy(buf, v_host, MAXBUF - 1);
-    if((cp = strchr(buf, ':')) != NULL)
-        *cp = '\0';
     if(addr.ai_family == AF_INET) {
+        memcpy(&in_addr, addr.ai_addr, sizeof(in_addr));
+        memcpy(&be_addr, be->addr.ai_addr, sizeof(be_addr));
+        if(port)
+            in_addr.sin_port = (in_port_t)htons(atoi(port));
+        else if(!strcasecmp(proto, "https"))
+            in_addr.sin_port = (in_port_t)htons(443);
+        else
+            in_addr.sin_port = (in_port_t)htons(80);
         /*
-         * check if the Location points to the Listener but with the wrong port or protocol
+         * check if the Location points to the back-end
          */
-        memcpy(&be_addr, lstn->addr.ai_addr, sizeof(be_addr));
-        if((memcmp(&be_addr.sin_addr.s_addr, &in_addr.sin_addr.s_addr, sizeof(in_addr.sin_addr.s_addr)) == 0
-          || strcasecmp(host, buf) == 0)
-        && (memcmp(&be_addr.sin_port, &in_addr.sin_port, sizeof(in_addr.sin_port)) != 0
-          || strcasecmp(proto, (lstn->ctx == NULL)? "http": "https"))) {
+        if(memcmp(&be_addr.sin_addr.s_addr, &in_addr.sin_addr.s_addr, sizeof(in_addr.sin_addr.s_addr)) == 0
+        && memcmp(&be_addr.sin_port, &in_addr.sin_port, sizeof(in_addr.sin_port)) == 0) {
             free(addr.ai_addr);
             return 1;
         }
     } else /* AF_INET6 */ {
+        memcpy(&in6_addr, addr.ai_addr, sizeof(in6_addr));
+        memcpy(&be6_addr, be->addr.ai_addr, sizeof(be6_addr));
+        if(port)
+            in6_addr.sin6_port = (in_port_t)htons(atoi(port));
+        else if(!strcasecmp(proto, "https"))
+            in6_addr.sin6_port = (in_port_t)htons(443);
+        else
+            in6_addr.sin6_port = (in_port_t)htons(80);
         /*
-         * check if the Location points to the Listener but with the wrong port or protocol
+         * check if the Location points to the back-end
          */
-        memcpy(&be6_addr, lstn->addr.ai_addr, sizeof(be6_addr));
-        if((memcmp(&be6_addr.sin6_addr.s6_addr, &in6_addr.sin6_addr.s6_addr, sizeof(in6_addr.sin6_addr.s6_addr)) == 0
-          || strcasecmp(host, buf) == 0)
-        && (memcmp(&be6_addr.sin6_port, &in6_addr.sin6_port, sizeof(in6_addr.sin6_port)) != 0
-          || strcasecmp(proto, (lstn->ctx == NULL)? "http": "https"))) {
+        if(memcmp(&be6_addr.sin6_addr.s6_addr, &in6_addr.sin6_addr.s6_addr, sizeof(in6_addr.sin6_addr.s6_addr)) == 0
+        && memcmp(&be6_addr.sin6_port, &in6_addr.sin6_port, sizeof(in6_addr.sin6_port)) == 0) {
             free(addr.ai_addr);
             return 1;
         }
@@ -874,25 +884,29 @@ need_rewrite(const int rewr_loc, char *const location, char *const path, const c
         free(addr.ai_addr);
         return 0;
     }
+    memset(buf, '\0', MAXBUF);
+    strncpy(buf, v_host, MAXBUF - 1);
+    if((cp = strchr(buf, ':')) != NULL)
+        *cp = '\0';
     if(addr.ai_family == AF_INET) {
-        memcpy(&in_addr, addr.ai_addr, sizeof(in_addr));
         memcpy(&be_addr, lstn->addr.ai_addr, sizeof(be_addr));
         /*
          * check if the Location points to the Listener but with the wrong port or protocol
          */
-        if(memcmp(&be_addr.sin_addr.s_addr, &in_addr.sin_addr.s_addr, sizeof(in_addr.sin_addr.s_addr)) == 0
+        if((memcmp(&be_addr.sin_addr.s_addr, &in_addr.sin_addr.s_addr, sizeof(in_addr.sin_addr.s_addr)) == 0
+          || strcasecmp(host, buf) == 0)
         && (memcmp(&be_addr.sin_port, &in_addr.sin_port, sizeof(in_addr.sin_port)) != 0
             || strcasecmp(proto, lstn->ctx? "http": "https"))) {
             free(addr.ai_addr);
             return 1;
         }
     } else {
-        memcpy(&in6_addr, addr.ai_addr, sizeof(in6_addr));
         memcpy(&be6_addr, lstn->addr.ai_addr, sizeof(be6_addr));
         /*
          * check if the Location points to the Listener but with the wrong port or protocol
          */
-        if(memcmp(&be6_addr.sin6_addr.s6_addr, &in6_addr.sin6_addr.s6_addr, sizeof(in6_addr.sin6_addr.s6_addr)) == 0
+        if((memcmp(&be6_addr.sin6_addr.s6_addr, &in6_addr.sin6_addr.s6_addr, sizeof(in6_addr.sin6_addr.s6_addr)) == 0
+          || strcasecmp(host, buf) == 0)
         && (memcmp(&be6_addr.sin6_port, &in6_addr.sin6_port, sizeof(in6_addr.sin6_port)) != 0
             || strcasecmp(proto, lstn->ctx? "http": "https"))) {
             free(addr.ai_addr);
@@ -1435,8 +1449,9 @@ do_RSAgen(void)
 }
 
 #include    "dh512.h"
-#include    "dh1024.h"
 
+#if DH_LEN == 1024
+#include    "dh1024.h"
 static DH   *DH512_params, *DH1024_params;
 
 DH *
@@ -1444,6 +1459,16 @@ DH_tmp_callback(/* not used */SSL *s, /* not used */int is_export, int keylength
 {
     return keylength == 512? DH512_params: DH1024_params;
 }
+#else
+#include    "dh2048.h"
+static DH   *DH512_params, *DH2048_params;
+
+DH *
+DH_tmp_callback(/* not used */SSL *s, /* not used */int is_export, int keylength)
+{
+    return keylength == 512? DH512_params: DH2048_params;
+}
+#endif
 
 static time_t   last_RSA, last_rescale, last_alive, last_expire;
 
@@ -1475,7 +1500,11 @@ init_timer(void)
     pthread_mutex_init(&RSA_mut, NULL);
 
     DH512_params = get_dh512();
+#if DH_LEN == 1024
     DH1024_params = get_dh1024();
+#else
+    DH2048_params = get_dh2048();
+#endif
 
     return;
 }
@@ -1638,7 +1667,7 @@ thr_control(void *arg)
 {
     CTRL_CMD        cmd;
     struct sockaddr sa;
-    int             ctl, dummy, ret_val;
+    int             ctl, dummy, n, ret_val;
     LISTENER        *lstn, dummy_lstn;
     SERVICE         *svc, dummy_svc;
     BACKEND         *be, dummy_be;
@@ -1676,6 +1705,8 @@ thr_control(void *arg)
         switch(cmd.cmd) {
         case CTRL_LST:
             /* logmsg(LOG_INFO, "thr_control() list"); */
+            n = get_thr_qlen();
+            (void)write(ctl, (void *)&n, sizeof(n));
             for(lstn = listeners; lstn; lstn = lstn->next) {
                 (void)write(ctl, (void *)lstn, sizeof(LISTENER));
                 (void)write(ctl, lstn->addr.ai_addr, lstn->addr.ai_addrlen);
@@ -1777,7 +1808,7 @@ thr_control(void *arg)
                 logmsg(LOG_WARNING, "thr_control() add session lock: %s", strerror(ret_val));
             t_add(svc->sessions, cmd.key, &be, sizeof(be));
             if(ret_val = pthread_mutex_unlock(&svc->mut))
-                logmsg(LOG_WARNING, "thr_control() add session unlock: %s", strerror(ret_val));
+                logmsg(LOG_WARNING, "thoriginalfiler_control() add session unlock: %s", strerror(ret_val));
             break;
         case CTRL_DEL_SESS:
             if((svc = sel_svc(&cmd)) == NULL) {
@@ -1795,5 +1826,29 @@ thr_control(void *arg)
             break;
         }
         close(ctl);
+    }
+}
+
+void
+SSLINFO_callback(const SSL *ssl, int where, int rc)
+{
+    RENEG_STATE *reneg_state;
+
+    /* Get our thr_arg where we're tracking this connection info */
+    if((reneg_state = (RENEG_STATE *)SSL_get_app_data(ssl)) == NULL)
+        return;
+
+    /* If we're rejecting renegotiations, move to ABORT if Client Hello is being read. */
+    if((where & SSL_CB_ACCEPT_LOOP) && *reneg_state == RENEG_REJECT) {
+        int state;
+
+        state = SSL_get_state(ssl);
+        if (state == SSL3_ST_SR_CLNT_HELLO_A || state == SSL23_ST_SR_CLNT_HELLO_A) {
+           *reneg_state = RENEG_ABORT;
+           logmsg(LOG_WARNING,"rejecting client initiated renegotiation");
+        }
+    } else if(where & SSL_CB_HANDSHAKE_DONE && *reneg_state == RENEG_INIT) {
+       // Reject any followup renegotiations
+       *reneg_state = RENEG_REJECT;
     }
 }
