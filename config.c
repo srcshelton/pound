@@ -78,18 +78,18 @@ static regex_t  ListenHTTP, ListenHTTPS, End, Address, Port, Cert, xHTTP, Client
 static regex_t  Err414, Err500, Err501, Err503, MaxRequest, HeadRemove, RewriteLocation, RewriteDestination;
 static regex_t  Service, ServiceName, URL, HeadRequire, HeadDeny, BackEnd, Emergency, Priority, HAport, HAportAddr;
 static regex_t  Redirect, RedirectN, TimeOut, Session, Type, TTL, ID, DynScale;
-static regex_t  ClientCert, AddHeader, DisableProto, SSLAllowClientRenegotiation, SSLHonorCipherOrder, Ciphers;
-static regex_t  CAlist, VerifyList, CRLlist, NoHTTPS11, Grace, Include, ConnTO, IgnoreCase, HTTPS;
-static regex_t  Disabled, Threads, CNName, Anonymise, ECDHCurve;
+static regex_t  ClientCert, AddHeader, DisableSSLv2, SSLAllowClientRenegotiation, SSLHonorCipherOrder, Ciphers;
+static regex_t  CAlist, VerifyList, CRLlist, NoHTTPS11, Grace, Include, ConnTO, IgnoreCase, HTTPS, HTTPSCert;
+static regex_t  Disabled, Threads, CNName, Anonymise;
 
 static regmatch_t   matches[5];
 
 static char *xhttp[] = {
     "^(GET|POST|HEAD) ([^ ]+) HTTP/1.[01]$",
-    "^(GET|POST|HEAD|PUT|PATCH|DELETE) ([^ ]+) HTTP/1.[01]$",
-    "^(GET|POST|HEAD|PUT|PATCH|DELETE|LOCK|UNLOCK|PROPFIND|PROPPATCH|SEARCH|MKCOL|MOVE|COPY|OPTIONS|TRACE|MKACTIVITY|CHECKOUT|MERGE|REPORT) ([^ ]+) HTTP/1.[01]$",
-    "^(GET|POST|HEAD|PUT|PATCH|DELETE|LOCK|UNLOCK|PROPFIND|PROPPATCH|SEARCH|MKCOL|MOVE|COPY|OPTIONS|TRACE|MKACTIVITY|CHECKOUT|MERGE|REPORT|SUBSCRIBE|UNSUBSCRIBE|BPROPPATCH|POLL|BMOVE|BCOPY|BDELETE|BPROPFIND|NOTIFY|CONNECT) ([^ ]+) HTTP/1.[01]$",
-    "^(GET|POST|HEAD|PUT|PATCH|DELETE|LOCK|UNLOCK|PROPFIND|PROPPATCH|SEARCH|MKCOL|MOVE|COPY|OPTIONS|TRACE|MKACTIVITY|CHECKOUT|MERGE|REPORT|SUBSCRIBE|UNSUBSCRIBE|BPROPPATCH|POLL|BMOVE|BCOPY|BDELETE|BPROPFIND|NOTIFY|CONNECT|RPC_IN_DATA|RPC_OUT_DATA) ([^ ]+) HTTP/1.[01]$",
+    "^(GET|POST|HEAD|PUT|DELETE) ([^ ]+) HTTP/1.[01]$",
+    "^(GET|POST|HEAD|PUT|DELETE|LOCK|UNLOCK|PROPFIND|PROPPATCH|SEARCH|MKCOL|MOVE|COPY|OPTIONS|TRACE|MKACTIVITY|CHECKOUT|MERGE|REPORT) ([^ ]+) HTTP/1.[01]$",
+    "^(GET|POST|HEAD|PUT|DELETE|LOCK|UNLOCK|PROPFIND|PROPPATCH|SEARCH|MKCOL|MOVE|COPY|OPTIONS|TRACE|MKACTIVITY|CHECKOUT|MERGE|REPORT|SUBSCRIBE|UNSUBSCRIBE|BPROPPATCH|POLL|BMOVE|BCOPY|BDELETE|BPROPFIND|NOTIFY|CONNECT) ([^ ]+) HTTP/1.[01]$",
+    "^(GET|POST|HEAD|PUT|DELETE|LOCK|UNLOCK|PROPFIND|PROPPATCH|SEARCH|MKCOL|MOVE|COPY|OPTIONS|TRACE|MKACTIVITY|CHECKOUT|MERGE|REPORT|SUBSCRIBE|UNSUBSCRIBE|BPROPPATCH|POLL|BMOVE|BCOPY|BDELETE|BPROPFIND|NOTIFY|CONNECT|RPC_IN_DATA|RPC_OUT_DATA) ([^ ]+) HTTP/1.[01]$",
 };
 
 static int  log_level = 1;
@@ -99,11 +99,6 @@ static int  be_to = 15;
 static int  be_connto = 15;
 static int  dynscale = 0;
 static int  ignore_case = 0;
-#if OPENSSL_VERSION_NUMBER >= 0x0090800fL
-#ifndef OPENSSL_NO_ECDH
-static int  EC_nid = NID_X9_62_prime256v1;
-#endif
-#endif
 
 #define MAX_FIN 8
 
@@ -189,8 +184,6 @@ get_subjectaltnames(X509 *x509, unsigned int *count)
     result = NULL;
     name = NULL;
     *count = 0;
-    if(san_stack == NULL)
-        return NULL;
     while(sk_GENERAL_NAME_num(san_stack) > 0) {
         name = sk_GENERAL_NAME_pop(san_stack);
         switch(name->type) {
@@ -256,7 +249,7 @@ parse_be(const int is_emergency)
             lin[strlen(lin) - 1] = '\0';
         if(!regexec(&Address, lin, 4, matches, 0)) {
             lin[matches[1].rm_eo] = '\0';
-            if(get_host(lin + matches[1].rm_so, &res->addr, PF_UNSPEC)) {
+            if(get_host(lin + matches[1].rm_so, &res->addr)) {
                 /* if we can't resolve it assume this is a UNIX domain socket */
                 res->addr.ai_socktype = SOCK_STREAM;
                 res->addr.ai_family = AF_UNIX;
@@ -320,7 +313,7 @@ parse_be(const int is_emergency)
             if(is_emergency)
                 conf_err("HAportAddr is not supported for Emergency back-ends");
             lin[matches[1].rm_eo] = '\0';
-            if(get_host(lin + matches[1].rm_so, &res->ha_addr, PF_UNSPEC)) {
+            if(get_host(lin + matches[1].rm_so, &res->ha_addr)) {
                 /* if we can't resolve it assume this is a UNIX domain socket */
                 res->addr.ai_socktype = SOCK_STREAM;
                 res->ha_addr.ai_family = AF_UNIX;
@@ -348,33 +341,17 @@ parse_be(const int is_emergency)
             SSL_CTX_set_app_data(res->ctx, res);
             SSL_CTX_set_verify(res->ctx, SSL_VERIFY_NONE, NULL);
             SSL_CTX_set_mode(res->ctx, SSL_MODE_AUTO_RETRY);
-#ifdef SSL_MODE_SEND_FALLBACK_SCSV
-            SSL_CTX_set_mode(res->ctx, SSL_MODE_SEND_FALLBACK_SCSV);
-#endif
             SSL_CTX_set_options(res->ctx, SSL_OP_ALL);
-#ifdef  SSL_OP_NO_COMPRESSION
-            SSL_CTX_set_options(res->ctx, SSL_OP_NO_COMPRESSION);
-#endif
             SSL_CTX_clear_options(res->ctx, SSL_OP_ALLOW_UNSAFE_LEGACY_RENEGOTIATION);
             SSL_CTX_clear_options(res->ctx, SSL_OP_LEGACY_SERVER_CONNECT);
             sprintf(lin, "%d-Pound-%ld", getpid(), random());
             SSL_CTX_set_session_id_context(res->ctx, (unsigned char *)lin, strlen(lin));
             SSL_CTX_set_tmp_rsa_callback(res->ctx, RSA_tmp_callback);
             SSL_CTX_set_tmp_dh_callback(res->ctx, DH_tmp_callback);
-#if OPENSSL_VERSION_NUMBER >= 0x0090800fL
-#ifndef OPENSSL_NO_ECDH
-            /* This generates a EC_KEY structure with no key, but a group defined */
-            EC_KEY *ecdh;
-            if((ecdh = EC_KEY_new_by_curve_name(EC_nid)) == NULL)
-                conf_err("Unable to generate temp ECDH key");
-            SSL_CTX_set_tmp_ecdh(res->ctx, ecdh);
-            SSL_CTX_set_options(res->ctx, SSL_OP_SINGLE_ECDH_USE);
-            EC_KEY_free(ecdh);
-#endif
-#endif
-        } else if(!regexec(&Cert, lin, 4, matches, 0)) {
-            if(res->ctx == NULL)
-                conf_err("BackEnd Cert can only be used after HTTPS - aborted");
+        } else if(!regexec(&HTTPSCert, lin, 4, matches, 0)) {
+            if((res->ctx = SSL_CTX_new(SSLv23_client_method())) == NULL)
+                conf_err("SSL_CTX_new failed - aborted");
+            SSL_CTX_set_app_data(res->ctx, res);
             lin[matches[1].rm_eo] = '\0';
             if(SSL_CTX_use_certificate_chain_file(res->ctx, lin + matches[1].rm_so) != 1)
                 conf_err("SSL_CTX_use_certificate_chain_file failed - aborted");
@@ -382,31 +359,15 @@ parse_be(const int is_emergency)
                 conf_err("SSL_CTX_use_PrivateKey_file failed - aborted");
             if(SSL_CTX_check_private_key(res->ctx) != 1)
                 conf_err("SSL_CTX_check_private_key failed - aborted");
-        } else if(!regexec(&Ciphers, lin, 4, matches, 0)) {
-            if(res->ctx == NULL)
-                conf_err("BackEnd Ciphers can only be used after HTTPS - aborted");
-            lin[matches[1].rm_eo] = '\0';
-            SSL_CTX_set_cipher_list(res->ctx, lin + matches[1].rm_so);
-        } else if(!regexec(&DisableProto, lin, 4, matches, 0)) {
-            if(res->ctx == NULL)
-                conf_err("BackEnd Disable can only be used after HTTPS - aborted");
-            lin[matches[1].rm_eo] = '\0';
-            if(strcasecmp(lin + matches[1].rm_so, "SSLv2") == 0)
-                SSL_CTX_set_options(res->ctx, SSL_OP_NO_SSLv2);
-            else if(strcasecmp(lin + matches[1].rm_so, "SSLv3") == 0)
-                SSL_CTX_set_options(res->ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3);
-#ifdef SSL_OP_NO_TLSv1
-            else if(strcasecmp(lin + matches[1].rm_so, "TLSv1") == 0)
-                SSL_CTX_set_options(res->ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_TLSv1);
-#endif
-#ifdef SSL_OP_NO_TLSv1_1
-            else if(strcasecmp(lin + matches[1].rm_so, "TLSv1_1") == 0)
-                SSL_CTX_set_options(res->ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_TLSv1 | SSL_OP_NO_TLSv1_1);
-#endif
-#ifdef SSL_OP_NO_TLSv1_2
-            else if(strcasecmp(lin + matches[1].rm_so, "TLSv1_2") == 0)
-                SSL_CTX_set_options(res->ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_TLSv1 | SSL_OP_NO_TLSv1_1 | SSL_OP_NO_TLSv1_2);
-#endif
+            SSL_CTX_set_verify(res->ctx, SSL_VERIFY_NONE, NULL);
+            SSL_CTX_set_mode(res->ctx, SSL_MODE_AUTO_RETRY);
+            SSL_CTX_set_options(res->ctx, SSL_OP_ALL);
+            SSL_CTX_clear_options(res->ctx, SSL_OP_ALLOW_UNSAFE_LEGACY_RENEGOTIATION);
+            SSL_CTX_clear_options(res->ctx, SSL_OP_LEGACY_SERVER_CONNECT);
+            sprintf(lin, "%d-Pound-%ld", getpid(), random());
+            SSL_CTX_set_session_id_context(res->ctx, (unsigned char *)lin, strlen(lin));
+            SSL_CTX_set_tmp_rsa_callback(res->ctx, RSA_tmp_callback);
+            SSL_CTX_set_tmp_dh_callback(res->ctx, DH_tmp_callback);
         } else if(!regexec(&Disabled, lin, 4, matches, 0)) {
             res->disabled = atoi(lin + matches[1].rm_so);
         } else if(!regexec(&End, lin, 4, matches, 0)) {
@@ -695,11 +656,9 @@ parse_service(const char *svc_name)
         } else if(!regexec(&Disabled, lin, 4, matches, 0)) {
             res->disabled = atoi(lin + matches[1].rm_so);
         } else if(!regexec(&End, lin, 4, matches, 0)) {
-            for(be = res->backends; be; be = be->next) {
-                if(!be->disabled)
-                    res->tot_pri += be->priority;
-                res->abs_pri += be->priority;
-            }
+            for(be = res->backends; be; be = be->next)
+                res->tot_pri += be->priority;
+            res->abs_pri = res->tot_pri;
             return res;
         } else {
             conf_err("unknown directive");
@@ -765,7 +724,7 @@ parse_HTTP(void)
             lin[strlen(lin) - 1] = '\0';
         if(!regexec(&Address, lin, 4, matches, 0)) {
             lin[matches[1].rm_eo] = '\0';
-            if(get_host(lin + matches[1].rm_so, &res->addr, PF_UNSPEC))
+            if(get_host(lin + matches[1].rm_so, &res->addr))
                 conf_err("Unknown Listener address");
             if(res->addr.ai_family != AF_INET && res->addr.ai_family != AF_INET6)
                 conf_err("Unknown Listener address family");
@@ -943,11 +902,7 @@ parse_HTTPS(void)
     POUND_CTX           *pc;
 
     ssl_op_enable = SSL_OP_ALL;
-#ifdef  SSL_OP_NO_COMPRESSION
-    ssl_op_enable |= SSL_OP_NO_COMPRESSION;
-#endif
-    ssl_op_disable = SSL_OP_ALLOW_UNSAFE_LEGACY_RENEGOTIATION | SSL_OP_LEGACY_SERVER_CONNECT
-                    | SSL_OP_DONT_INSERT_EMPTY_FRAGMENTS;
+    ssl_op_disable = SSL_OP_ALLOW_UNSAFE_LEGACY_RENEGOTIATION | SSL_OP_LEGACY_SERVER_CONNECT;
 
     if((res = (LISTENER *)malloc(sizeof(LISTENER))) == NULL)
         conf_err("ListenHTTPS config: out of memory - aborted");
@@ -960,6 +915,7 @@ parse_HTTPS(void)
     res->err501 = "This method may not be used.";
     res->err503 = "The service is not available. Please try again later.";
     res->allow_client_reneg = 0;
+    res->disable_ssl_v2 = 0;
     res->log_level = log_level;
     if(regcomp(&res->verb, xhttp[0], REG_ICASE | REG_NEWLINE | REG_EXTENDED))
         conf_err("xHTTP bad default pattern - aborted");
@@ -969,7 +925,7 @@ parse_HTTPS(void)
             lin[strlen(lin) - 1] = '\0';
         if(!regexec(&Address, lin, 4, matches, 0)) {
             lin[matches[1].rm_eo] = '\0';
-            if(get_host(lin + matches[1].rm_so, &res->addr, PF_UNSPEC))
+            if(get_host(lin + matches[1].rm_so, &res->addr))
                 conf_err("Unknown Listener address");
             if(res->addr.ai_family != AF_INET && res->addr.ai_family != AF_INET6)
                 conf_err("Unknown Listener address family");
@@ -1148,24 +1104,8 @@ parse_HTTPS(void)
                 strcat(res->add_head, "\r\n");
                 strcat(res->add_head, lin + matches[1].rm_so);
             }
-        } else if(!regexec(&DisableProto, lin, 4, matches, 0)) {
-            lin[matches[1].rm_eo] = '\0';
-            if(strcasecmp(lin + matches[1].rm_so, "SSLv2") == 0)
-                ssl_op_enable |= SSL_OP_NO_SSLv2;
-            else if(strcasecmp(lin + matches[1].rm_so, "SSLv3") == 0)
-                ssl_op_enable |= SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3;
-#ifdef SSL_OP_NO_TLSv1
-            else if(strcasecmp(lin + matches[1].rm_so, "TLSv1") == 0)
-                ssl_op_enable |= SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_TLSv1;
-#endif
-#ifdef SSL_OP_NO_TLSv1_1
-            else if(strcasecmp(lin + matches[1].rm_so, "TLSv1_1") == 0)
-                ssl_op_enable |= SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_TLSv1 | SSL_OP_NO_TLSv1_1;
-#endif
-#ifdef SSL_OP_NO_TLSv1_2
-            else if(strcasecmp(lin + matches[1].rm_so, "TLSv1_2") == 0)
-                ssl_op_enable |= SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_TLSv1 | SSL_OP_NO_TLSv1_1 | SSL_OP_NO_TLSv1_2;
-#endif
+        } else if(!regexec(&DisableSSLv2, lin, 4, matches, 0)) {
+            res->disable_ssl_v2 = 1;
         } else if(!regexec(&SSLAllowClientRenegotiation, lin, 4, matches, 0)) {
             res->allow_client_reneg = atoi(lin + matches[1].rm_so);
             if (res->allow_client_reneg == 2) {
@@ -1254,32 +1194,22 @@ parse_HTTPS(void)
             if(!has_addr || !has_port || res->ctx == NULL)
                 conf_err("ListenHTTPS missing Address, Port or Certificate - aborted");
 #ifdef SSL_CTRL_SET_TLSEXT_SERVERNAME_CB
-            if(res->ctx->next)
-                if(!SSL_CTX_set_tlsext_servername_callback(res->ctx->ctx, SNI_server_name)
-                || !SSL_CTX_set_tlsext_servername_arg(res->ctx->ctx, res->ctx))
-                    conf_err("ListenHTTPS: can't set SNI callback");
+            if(!SSL_CTX_set_tlsext_servername_callback(res->ctx->ctx, SNI_server_name)
+            || !SSL_CTX_set_tlsext_servername_arg(res->ctx->ctx, res->ctx))
+                conf_err("ListenHTTPS: can't set SNI callback");
 #endif
             for(pc = res->ctx; pc; pc = pc->next) {
                 SSL_CTX_set_app_data(pc->ctx, res);
                 SSL_CTX_set_mode(pc->ctx, SSL_MODE_AUTO_RETRY);
                 SSL_CTX_set_options(pc->ctx, ssl_op_enable);
                 SSL_CTX_clear_options(pc->ctx, ssl_op_disable);
+                if (res->disable_ssl_v2 == 1)
+                    SSL_CTX_set_options(pc->ctx, SSL_OP_NO_SSLv2);
                 sprintf(lin, "%d-Pound-%ld", getpid(), random());
                 SSL_CTX_set_session_id_context(pc->ctx, (unsigned char *)lin, strlen(lin));
                 SSL_CTX_set_tmp_rsa_callback(pc->ctx, RSA_tmp_callback);
                 SSL_CTX_set_tmp_dh_callback(pc->ctx, DH_tmp_callback);
                 SSL_CTX_set_info_callback(pc->ctx, SSLINFO_callback);
-#if OPENSSL_VERSION_NUMBER >= 0x0090800fL
-#ifndef OPENSSL_NO_ECDH
-                /* This generates a EC_KEY structure with no key, but a group defined */
-                EC_KEY *ecdh;
-                if((ecdh = EC_KEY_new_by_curve_name(EC_nid)) == NULL)
-                    conf_err("Unable to generate temp ECDH key");
-                SSL_CTX_set_tmp_ecdh(pc->ctx, ecdh);
-                SSL_CTX_set_options(pc->ctx, SSL_OP_SINGLE_ECDH_USE);
-                EC_KEY_free(ecdh);
-#endif
-#endif
             }
             return res;
         } else {
@@ -1350,14 +1280,6 @@ parse_file(void)
             be_connto = atoi(lin + matches[1].rm_so);
         } else if(!regexec(&IgnoreCase, lin, 4, matches, 0)) {
             ignore_case = atoi(lin + matches[1].rm_so);
-#if OPENSSL_VERSION_NUMBER >= 0x0090800fL
-#ifndef OPENSSL_NO_ECDH
-        } else if(!regexec(&ECDHCurve, lin, 4, matches, 0)) {
-            lin[matches[1].rm_eo] = '\0';
-            if((EC_nid = OBJ_sn2nid(lin + matches[1].rm_so)) == 0)
-                conf_err("ECDHCurve config: invalid curve name");
-#endif
-#endif
 #if HAVE_OPENSSL_ENGINE_H
         } else if(!regexec(&SSLEngine, lin, 4, matches, 0)) {
             lin[matches[1].rm_eo] = '\0';
@@ -1485,7 +1407,7 @@ config_parse(const int argc, char **const argv)
     || regcomp(&ClientCert, "^[ \t]*ClientCert[ \t]+([0-3])[ \t]+([1-9])[ \t]*$", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
     || regcomp(&AddHeader, "^[ \t]*AddHeader[ \t]+\"(.+)\"[ \t]*$", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
     || regcomp(&SSLAllowClientRenegotiation, "^[ \t]*SSLAllowClientRenegotiation[ \t]+([012])[ \t]*$", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
-    || regcomp(&DisableProto, "^[ \t]*Disable[ \t]+(SSLv2|SSLv3|TLSv1|TLSv1_1|TLSv1_2)[ \t]*$", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
+    || regcomp(&DisableSSLv2, "^[ \t]*DisableSSLv2[ \t]*$", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
     || regcomp(&SSLHonorCipherOrder, "^[ \t]*SSLHonorCipherOrder[ \t]+([01])[ \t]*$", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
     || regcomp(&Ciphers, "^[ \t]*Ciphers[ \t]+\"(.+)\"[ \t]*$", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
     || regcomp(&CAlist, "^[ \t]*CAlist[ \t]+\"(.+)\"[ \t]*$", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
@@ -1496,14 +1418,10 @@ config_parse(const int argc, char **const argv)
     || regcomp(&ConnTO, "^[ \t]*ConnTO[ \t]+([1-9][0-9]*)[ \t]*$", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
     || regcomp(&IgnoreCase, "^[ \t]*IgnoreCase[ \t]+([01])[ \t]*$", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
     || regcomp(&HTTPS, "^[ \t]*HTTPS[ \t]*$", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
-    || regcomp(&Disabled, "^[ \t]*Disabled[ \t]+([01])[ \t]*$", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
+    || regcomp(&HTTPSCert, "^[ \t]*HTTPS[ \t]+\"(.+)\"[ \t]*$", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
+    || regcomp(&Disabled, "^[ \t]*Disabled[ \t]+[01][ \t]*$", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
     || regcomp(&CNName, ".*[Cc][Nn]=([-*.A-Za-z0-9]+).*$", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
     || regcomp(&Anonymise, "^[ \t]*Anonymise[ \t]*$", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
-#if OPENSSL_VERSION_NUMBER >= 0x0090800fL
-#ifndef OPENSSL_NO_ECDH
-    || regcomp(&ECDHCurve, "^[ \t]*ECDHCurve[ \t]+\"(.+)\"[ \t]*$", REG_ICASE | REG_NEWLINE | REG_EXTENDED)
-#endif
-#endif
     ) {
         logmsg(LOG_ERR, "bad config Regex - aborted");
         exit(1);
@@ -1559,10 +1477,6 @@ config_parse(const int argc, char **const argv)
 #ifdef  C_GROUP
             if(strcmp(C_GROUP, ""))
                 logmsg(LOG_DEBUG, "    --with-group=%s", C_GROUP);
-#endif
-#ifdef  C_DH_LEN
-            if(strcmp(C_DH_LEN, "0"))
-                logmsg(LOG_DEBUG, "    --with-dh=%s", C_DH_LEN);
 #endif
             logmsg(LOG_DEBUG, "Exiting...");
             exit(0);
@@ -1655,7 +1569,7 @@ config_parse(const int argc, char **const argv)
     regfree(&ClientCert);
     regfree(&AddHeader);
     regfree(&SSLAllowClientRenegotiation);
-    regfree(&DisableProto);
+    regfree(&DisableSSLv2);
     regfree(&SSLHonorCipherOrder);
     regfree(&Ciphers);
     regfree(&CAlist);
@@ -1666,14 +1580,10 @@ config_parse(const int argc, char **const argv)
     regfree(&ConnTO);
     regfree(&IgnoreCase);
     regfree(&HTTPS);
+    regfree(&HTTPSCert);
     regfree(&Disabled);
     regfree(&CNName);
     regfree(&Anonymise);
-#if OPENSSL_VERSION_NUMBER >= 0x0090800fL
-#ifndef OPENSSL_NO_ECDH
-    regfree(&ECDHCurve);
-#endif
-#endif
 
     /* set the facility only here to ensure the syslog gets opened if necessary */
     log_facility = def_facility;

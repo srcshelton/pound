@@ -52,8 +52,7 @@ err_reply(BIO *const c, const char *head, const char *txt)
 static void
 redirect_reply(BIO *const c, const char *url, const int code)
 {
-    char    rep[MAXBUF], cont[MAXBUF], safe_url[MAXBUF], *code_msg;
-    int     i, j;
+    char    rep[MAXBUF], cont[MAXBUF], *code_msg;
 
     switch(code) {
     case 301:
@@ -66,24 +65,12 @@ redirect_reply(BIO *const c, const char *url, const int code)
         code_msg = "Found";
         break;
     }
-    /*
-     * Make sure to return a safe version of the URL (otherwise CSRF becomes a possibility)
-     */
-    memset(safe_url, 0, MAXBUF);
-    for(i = j = 0; i < MAXBUF && j < MAXBUF && url[i]; i++)
-        if(isalnum(url[i]) || url[i] == '_' || url[i] == '.' || url[i] == ':' || url[i] == '/'
-        || url[i] == '?' || url[i] == '&' || url[i] == ';' || url[i] == '-' || url[i] == '=')
-            safe_url[j++] = url[i];
-        else {
-            sprintf(safe_url + j, "%%%02x", url[i]);
-            j += 3;
-        }
     snprintf(cont, sizeof(cont),
         "<html><head><title>Redirect</title></head><body><h1>Redirect</h1><p>You should go to <a href=\"%s\">%s</a></p></body></html>",
-        safe_url, safe_url);
+        url, url);
     snprintf(rep, sizeof(rep),
         "HTTP/1.0 %d %s\r\nLocation: %s\r\nContent-Type: text/html\r\nContent-Length: %d\r\n\r\n",
-        code, code_msg, safe_url, strlen(cont));
+        code, code_msg, url, strlen(cont));
     BIO_write(c, rep, strlen(rep));
     BIO_write(c, cont, strlen(cont));
     BIO_flush(c);
@@ -614,7 +601,6 @@ do_http(thr_arg *arg)
             && SSL_get_verify_result(ssl) != X509_V_OK) {
                 addr2str(caddr, MAXBUF - 1, &from_host, 1);
                 logmsg(LOG_NOTICE, "Bad certificate from %s", caddr);
-                X509_free(x509);
                 BIO_reset(cl);
                 BIO_free_all(cl);
                 return;
@@ -627,8 +613,6 @@ do_http(thr_arg *arg)
 
     if((bb = BIO_new(BIO_f_buffer())) == NULL) {
         logmsg(LOG_WARNING, "(%lx) BIO_new(buffer) failed", pthread_self());
-        if(x509 != NULL)
-            X509_free(x509);
         BIO_reset(cl);
         BIO_free_all(cl);
         return;
@@ -724,21 +708,9 @@ do_http(thr_arg *arg)
             case HEADER_CONTENT_LENGTH:
                 if(chunked || cont >= 0L)
                     headers_ok[n] = 0;
-                else {
-                     if((cont = ATOL(buf)) < 0L)
-                         headers_ok[n] = 0;
-                    if(is_rpc == 1 && (cont < 0x20000L || cont > 0x80000000L))
-                        is_rpc = -1;
-                }
-                break;
-            case HEADER_EXPECT:
-                /*
-                 * we do NOT support the "Expect: 100-continue" headers
-                 * support may involve severe performance penalties (non-responding back-end, etc)
-                 * as a stop-gap measure we just skip these headers
-                 */
-                if(!strcasecmp("100-continue", buf))
-                    headers_ok[n] = 0;
+                else
+                    if((cont = ATOL(buf)) < 0L)
+                        headers_ok[n] = 0;
                 break;
             case HEADER_ILLEGAL:
                 if(lstn->log_level > 0) {
@@ -1010,12 +982,12 @@ do_http(thr_arg *arg)
 
         /* if SSL put additional headers for client certificate */
         if(cur_backend->be_type == 0 && ssl != NULL) {
-            const SSL_CIPHER  *cipher;
+            SSL_CIPHER  *cipher;
 
             if((cipher = SSL_get_current_cipher(ssl)) != NULL) {
                 SSL_CIPHER_description(cipher, buf, MAXBUF - 1);
                 strip_eol(buf);
-                if(BIO_printf(be, "X-SSL-cipher: %s/%s\r\n", SSL_get_version(ssl), buf) <= 0) {
+                if(BIO_printf(be, "X-SSL-cipher: %s\r\n", buf) <= 0) {
                     str_be(buf, MAXBUF - 1, cur_backend);
                     end_req = cur_time();
                     logmsg(LOG_WARNING, "(%lx) e500 error write X-SSL-cipher to %s: %s (%.3f sec)",
@@ -1397,12 +1369,8 @@ do_http(thr_arg *arg)
                 case HEADER_CONTENT_LENGTH:
                     cont = ATOL(buf);
                     /* treat RPC_OUT_DATA like reply without content-length */
-                    if(is_rpc == 0) {
-                        if(cont >= 0x20000L && cont <= 0x80000000L)
-                            cont = -1L;
-                        else
-                            is_rpc = -1;
-                    }
+                    if(is_rpc == 0 && cont == 0x40000000L)
+                        cont = -1L;
                     break;
                 case HEADER_LOCATION:
                     if(v_host[0] && need_rewrite(lstn->rewr_loc, buf, loc_path, v_host, lstn, cur_backend)) {
@@ -1636,7 +1604,7 @@ thr_http(void *dummy)
 
     for(;;) {
         while((arg = get_thr_arg()) == NULL)
-            logmsg(LOG_NOTICE, "NULL get_thr_arg");
+            logmsg(LOG_WARNING, "NULL get_thr_arg");
         do_http(arg);
     }
 }
